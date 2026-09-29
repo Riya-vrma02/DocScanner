@@ -28,7 +28,9 @@ const styles = StyleSheet.create({
     borderRadius: 8, padding: 8, marginVertical: 4, marginHorizontal: 8, elevation: 2,
   },
   thumb: { width: 56, height: 76, borderRadius: 4, backgroundColor: '#eee' },
-  label: { flex: 1, marginLeft: 12, fontSize: 16 },
+  // Explicit color: without it, the label inherits a light default in system
+  // dark mode and disappears against the white card.
+  label: { flex: 1, marginLeft: 12, fontSize: 16, color: '#111' },
   deleteBtn: { padding: 8 },
   deleteText: { color: '#D32F2F', fontSize: 16 },
 });

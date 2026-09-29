@@ -1,6 +1,7 @@
 package com.docscannerrn
 
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -12,7 +13,10 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.pdf.PdfDocument
+import android.media.ExifInterface
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.provider.MediaStore
 import android.util.Base64
 import androidx.core.content.FileProvider
@@ -21,6 +25,7 @@ import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.MatOfInt
 import org.opencv.core.MatOfPoint
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
@@ -49,6 +54,9 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
 
     private var capturePromise: Promise? = null
     private var pendingCapturePath: String? = null
+
+    /** ML page segmentation (paper_seg.onnx); falls back to CV when unavailable. */
+    private val paperSegmenter by lazy { PaperSegmenter(reactContext.applicationContext) }
 
 
     init {
@@ -96,11 +104,64 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
         capturePromise = null
 
         if (resultCode == Activity.RESULT_OK && pendingCapturePath != null) {
-            promise.resolve(pendingCapturePath)
+            val path = pendingCapturePath!!
+            try {
+                // Bake the camera's EXIF orientation into the actual pixels.
+                // BitmapFactory.decodeFile (used everywhere downstream for OpenCV
+                // detection + perspective warp) ignores EXIF, while RN's <Image>
+                // honors it — so without this, detection runs in a rotated
+                // coordinate space that doesn't match what the user sees in the
+                // crop UI, and the document never gets cropped correctly.
+                normalizeOrientation(path)
+            } catch (e: Exception) {
+                // Non-fatal: if normalization fails, fall back to the raw capture.
+            }
+            promise.resolve(path)
         } else {
             promise.reject("CAPTURE_CANCELLED", "Photo capture was cancelled or failed")
         }
         pendingCapturePath = null
+    }
+
+    /**
+     * Reads the JPEG's EXIF orientation flag, physically rotates/flips the
+     * pixels so the image is upright, rewrites the file, and resets the flag
+     * to "normal". This guarantees a single, consistent orientation for OpenCV
+     * detection, the crop UI, and the perspective warp.
+     */
+    private fun normalizeOrientation(path: String) {
+        val exif = ExifInterface(path)
+        val orientation = exif.getAttributeInt(
+            ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL
+        )
+        if (orientation == ExifInterface.ORIENTATION_NORMAL ||
+            orientation == ExifInterface.ORIENTATION_UNDEFINED
+        ) {
+            return
+        }
+
+        val bitmap = BitmapFactory.decodeFile(path) ?: return
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> { matrix.postRotate(90f); matrix.postScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_TRANSVERSE -> { matrix.postRotate(270f); matrix.postScale(-1f, 1f) }
+            else -> return
+        }
+
+        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        writeJpeg(rotated, path)
+        if (rotated != bitmap) bitmap.recycle()
+
+        // Clear the flag so nothing rotates the already-upright pixels a second time.
+        ExifInterface(path).apply {
+            setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
+            saveAttributes()
+        }
     }
 
     override fun onNewIntent(intent: Intent?) {}
@@ -478,6 +539,66 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
         else -> 595 to 842
     }
 
+    /**
+     * Copies a generated PDF into the device's public Downloads folder so it
+     * persists outside the app's private storage and is visible in Files apps.
+     *
+     * On API 29+ this uses MediaStore (scoped storage — no permission needed).
+     * On API 23-28 it writes directly to the public Downloads directory, which
+     * requires WRITE_EXTERNAL_STORAGE (declared with maxSdkVersion=28 and
+     * requested at runtime by the caller).
+     *
+     * Resolves with a user-facing location string.
+     */
+    @ReactMethod
+    fun savePdfToDownloads(sourcePath: String, displayName: String, promise: Promise) {
+        try {
+            val src = File(sourcePath)
+            if (!src.exists()) {
+                promise.reject("NOT_FOUND", "No file at $sourcePath")
+                return
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val resolver = reactContext.contentResolver
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (uri == null) {
+                    promise.reject("INSERT_FAILED", "Could not create an entry in Downloads")
+                    return
+                }
+                val opened = resolver.openOutputStream(uri)
+                if (opened == null) {
+                    resolver.delete(uri, null, null)
+                    promise.reject("OPEN_FAILED", "Could not open Downloads entry for writing")
+                    return
+                }
+                opened.use { out -> src.inputStream().use { input -> input.copyTo(out) } }
+
+                // Clear IS_PENDING so the file becomes visible to other apps.
+                val done = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                resolver.update(uri, done, null, null)
+
+                promise.resolve("Downloads/$displayName")
+            } else {
+                val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!dir.exists()) dir.mkdirs()
+                val dest = File(dir, displayName)
+                src.inputStream().use { input ->
+                    FileOutputStream(dest).use { out -> input.copyTo(out) }
+                }
+                promise.resolve(dest.absolutePath)
+            }
+        } catch (e: Exception) {
+            promise.reject("SAVE_FAILED", e.message, e)
+        }
+    }
+
     // ---------------------------------------------------------------------
     // 6. MULTI-DOCUMENT DETECTION + TORN/IRREGULAR-EDGE CROPPING
     // ---------------------------------------------------------------------
@@ -526,80 +647,44 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
     }
 
     private fun findAllDocuments(bitmap: Bitmap): List<DetectedDoc> {
+        val srcFull = Mat()
+        Utils.bitmapToMat(bitmap, srcFull)
+
+        // Downscale for detection (real photos are huge, e.g. 2080x4608):
+        // faster and less texture noise. Corners get scaled back to full res.
+        val longEdge = max(srcFull.rows(), srcFull.cols()).toDouble()
+        val detectScale = if (longEdge > 800.0) 800.0 / longEdge else 1.0
         val src = Mat()
-        Utils.bitmapToMat(bitmap, src)
-
-        val gray = Mat()
-        Imgproc.cvtColor(src, gray, Imgproc.COLOR_RGBA2GRAY)
-        Imgproc.GaussianBlur(gray, gray, Size(5.0, 5.0), 0.0)
-
-        val edges = Mat()
-        Imgproc.Canny(gray, edges, 50.0, 150.0)
-        // Morphological closing bridges small gaps along a torn/ragged edge
-        // that a plain Canny output would otherwise leave as broken lines.
-        val closeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(9.0, 9.0))
-        Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, closeKernel)
-        Imgproc.dilate(edges, edges, Mat())
-
-        val contours = mutableListOf<MatOfPoint>()
-        val hierarchy = Mat()
-        Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
-
-        val imageArea = src.rows() * src.cols()
-        // Lower threshold than the single-document case (0.2 -> 0.05): a stacked
-        // or side-by-side page can legitimately occupy a smaller fraction of frame.
-        val minAreaThreshold = imageArea * 0.05
-
-        val candidates = contours
-            .map { it to Imgproc.contourArea(it) }
-            .filter { it.second > minAreaThreshold }
-            .sortedByDescending { it.second }
-
-        val results = mutableListOf<DetectedDoc>()
-        val usedRects = mutableListOf<org.opencv.core.Rect>()
-
-        for ((contour, area) in candidates) {
-            val rect = Imgproc.boundingRect(contour)
-
-            // Skip contours that substantially overlap one already accepted —
-            // avoids double-counting the same page's inner and outer edge.
-            val overlapsExisting = usedRects.any { existing ->
-                val interW = (min(existing.x + existing.width, rect.x + rect.width) - max(existing.x, rect.x))
-                val interH = (min(existing.y + existing.height, rect.y + rect.height) - max(existing.y, rect.y))
-                val interArea = interW.coerceAtLeast(0) * interH.coerceAtLeast(0)
-                interArea > 0.5 * min(existing.width * existing.height, rect.width * rect.height)
-            }
-            if (overlapsExisting) continue
-
-            val c2f = MatOfPoint2f(*contour.toArray())
-            val peri = Imgproc.arcLength(c2f, true)
-            val approx4 = MatOfPoint2f()
-            Imgproc.approxPolyDP(c2f, approx4, 0.02 * peri, true)
-
-            if (approx4.total() == 4L) {
-                val quadArea = Imgproc.contourArea(approx4)
-                // A torn/irregular shape can sometimes still approx down to 4
-                // points, but loses real area doing so — only trust it as a
-                // clean quadrilateral if the 4-point simplification keeps at
-                // least 85% of the actual contour's area.
-                if (quadArea > area * 0.85) {
-                    val pts = approx4.toArray().map { floatArrayOf(it.x.toFloat(), it.y.toFloat()) }
-                    results.add(DetectedDoc(orderCorners(pts), true, area))
-                    usedRects.add(rect)
-                    continue
-                }
-            }
-
-            // Irregular/torn edge: keep a more detailed polygon (smaller
-            // epsilon than the quad attempt) instead of forcing 4 points.
-            val approxDetailed = MatOfPoint2f()
-            Imgproc.approxPolyDP(c2f, approxDetailed, 0.005 * peri, true)
-            val pts = approxDetailed.toArray().map { floatArrayOf(it.x.toFloat(), it.y.toFloat()) }
-            results.add(DetectedDoc(pts, false, area))
-            usedRects.add(rect)
+        if (detectScale < 1.0) {
+            Imgproc.resize(srcFull, src, Size(srcFull.cols() * detectScale, srcFull.rows() * detectScale))
+        } else {
+            srcFull.copyTo(src)
         }
 
-        gray.release(); edges.release(); hierarchy.release(); src.release()
+        // Build grayscale + HSV and delegate to the shared detector (the HSV
+        // pass isolates a white page from a colored background). See
+        // DocumentDetector — the same code powers the live camera analyzer.
+        val rgb = Mat()
+        Imgproc.cvtColor(src, rgb, Imgproc.COLOR_RGBA2RGB)
+        val gray = Mat()
+        Imgproc.cvtColor(rgb, gray, Imgproc.COLOR_RGB2GRAY)
+        val hsv = Mat()
+        Imgproc.cvtColor(rgb, hsv, Imgproc.COLOR_RGB2HSV)
+
+        // Primary: ML page segmentation; fallback: classical contour detection.
+        val quad = paperSegmenter.findPageQuad(src)
+            ?: DocumentDetector.findBestQuad(gray, hsv)
+
+        val results = mutableListOf<DetectedDoc>()
+        if (quad != null) {
+            val quadArea = Imgproc.contourArea(MatOfPoint2f(*quad))
+            val pts = quad.map {
+                floatArrayOf((it.x / detectScale).toFloat(), (it.y / detectScale).toFloat())
+            }
+            results.add(DetectedDoc(pts, true, quadArea / (detectScale * detectScale)))
+        }
+
+        rgb.release(); gray.release(); hsv.release(); src.release(); srcFull.release()
         return results
     }
 

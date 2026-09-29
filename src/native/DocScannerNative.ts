@@ -81,4 +81,11 @@ export const DocScannerNative = {
     pageSize: PageSizeName,
     outputPath: string
   ): Promise<string> => DocScannerModule.exportToPdf(imagePaths, pageSize, outputPath),
+
+  /**
+   * Copies a generated PDF into the device's public Downloads folder.
+   * Resolves with a user-facing location (e.g. "Downloads/Scan_123.pdf").
+   */
+  savePdfToDownloads: (sourcePath: string, displayName: string): Promise<string> =>
+    DocScannerModule.savePdfToDownloads(sourcePath, displayName),
 };

@@ -1,7 +1,13 @@
 <resources>
 
     <!-- Base application theme. -->
-    <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+    <!--
+      Light (not DayNight): the whole UI is designed light — white modal cards,
+      #f2f2f2 backgrounds. Under DayNight, any <Text> without an explicit color
+      flips to white in system dark mode and becomes invisible on those white
+      surfaces (this is what hid the page-size options in the export modal).
+    -->
+    <style name="AppTheme" parent="Theme.AppCompat.Light.NoActionBar">
         <!-- Customize your theme here. -->
         <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
     </style>

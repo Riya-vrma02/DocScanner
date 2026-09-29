@@ -4,7 +4,7 @@ import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import HomeScreen from './src/screens/HomeScreen';
-import ScanScreen from './src/screens/ScanScreen';
+import CameraScanScreen from './src/screens/CameraScanScreen';
 import CropScreen from './src/screens/CropScreen';
 import IrregularCropScreen from './src/screens/IrregularCropScreen';
 import MultiDocPickerScreen from './src/screens/MultiDocPickerScreen';
@@ -27,7 +27,7 @@ export default function App() {
       <NavigationContainer>
         <Stack.Navigator>
           <Stack.Screen name="Home" component={HomeScreen} options={{ title: 'DocScanner' }} />
-          <Stack.Screen name="Scan" component={ScanScreen} options={{ headerShown: false }} />
+          <Stack.Screen name="Scan" component={CameraScanScreen} options={{ headerShown: false }} />
           <Stack.Screen name="Crop" component={CropScreen} options={{ title: 'Adjust corners' }} />
           <Stack.Screen name="IrregularCrop" component={IrregularCropScreen} options={{ title: 'Confirm crop' }} />
           <Stack.Screen name="MultiDocPicker" component={MultiDocPickerScreen} options={{ title: 'Select pages' }} />
