@@ -14,6 +14,8 @@ import org.opencv.core.Point
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.nio.FloatBuffer
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * ML page segmentation using `paper_seg.onnx` from
@@ -43,6 +45,9 @@ class PaperSegmenter(private val context: Context) {
 
         /** Push corners outward so a sliver of background is kept (reference: 1.10). */
         private const val EXPAND_SCALE = 1.10
+
+        /** A plain 4-corner shape is kept only if it matches the outline this closely (IoU). */
+        private const val QUAD_IOU = 0.985
     }
 
     private var session: OrtSession? = null
@@ -90,7 +95,16 @@ class PaperSegmenter(private val context: Context) {
      * corners ordered [TL, TR, BR, BL] in **[rgba]'s own pixel coordinates**,
      * or null if unavailable / no single quad fits.
      */
-    fun findPageQuad(rgba: Mat): Array<Point>? {
+    fun findPageQuad(rgba: Mat): Array<Point>? = withMask(rgba) { quadFromMask(it) }
+
+    /**
+     * Same segmentation mask, but returns the paper's actual outline (4..24 points,
+     * in [rgba]'s pixel coordinates) so torn edges, cut corners and curved sides
+     * survive. A clean rectangular page still comes back as exactly 4 points.
+     */
+    fun findPagePolygon(rgba: Mat): Array<Point>? = withMask(rgba) { polygonFromMask(it) }
+
+    private fun withMask(rgba: Mat, fit: (Mat) -> Array<Point>?): Array<Point>? {
         val s = getSession() ?: return null
         val e = env ?: return null
 
@@ -167,9 +181,9 @@ class PaperSegmenter(private val context: Context) {
                 0.0, 0.0, Imgproc.INTER_LINEAR
             )
 
-            val quad = quadFromMask(maskFull)
-            lastError = if (quad == null) "no_quad (mask empty or too irregular)" else null
-            return quad
+            val result = fit(maskFull)
+            lastError = if (result == null) "no_shape (mask empty or too irregular)" else null
+            return result
         } catch (t: Throwable) {
             lastError = "infer ${t::class.java.simpleName}: ${t.message}"
             return null
@@ -254,6 +268,97 @@ class PaperSegmenter(private val context: Context) {
         } finally {
             bin.release()
         }
+    }
+
+    /**
+     * Mask -> irregular polygon. Unlike [quadFromMask] there is NO convex hull and
+     * NO forcing to 4 corners, so concave tears and curved edges are preserved.
+     * If a plain 4-corner shape matches the outline almost exactly (IoU >= QUAD_IOU),
+     * that quad is returned instead, so clean flat pages keep the perspective-crop path.
+     */
+    private fun polygonFromMask(mask: Mat): Array<Point>? {
+        val bin = Mat()
+        try {
+            Imgproc.threshold(mask, bin, 127.0, 255.0, Imgproc.THRESH_BINARY)
+            val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
+            Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_OPEN, kernel)
+            Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_CLOSE, kernel)
+
+            // Grow the mask a hair so the outline sits ON the paper edge rather than just
+            // inside it (replaces the centroid-scaling expandQuad, which would distort
+            // an irregular shape).
+            val r = max(2, (min(bin.rows(), bin.cols()) * 0.006).toInt())
+            val grow = Imgproc.getStructuringElement(
+                Imgproc.MORPH_ELLIPSE, Size((2 * r + 1).toDouble(), (2 * r + 1).toDouble())
+            )
+            Imgproc.dilate(bin, bin, grow)
+
+            val contours = mutableListOf<MatOfPoint>()
+            val hierarchy = Mat()
+            Imgproc.findContours(
+                bin, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE
+            )
+            hierarchy.release()
+
+            val imgArea = (mask.rows() * mask.cols()).toDouble()
+            val biggest = contours.maxByOrNull { Imgproc.contourArea(it) } ?: return null
+            if (Imgproc.contourArea(biggest) < 0.03 * imgArea) return null
+
+            // Small epsilon keeps bends and tears; loosen only if there are too many
+            // points to edit comfortably.
+            val c2f = MatOfPoint2f(*biggest.toArray())
+            val peri = Imgproc.arcLength(c2f, true)
+            val approx = MatOfPoint2f()
+            var eps = 0.004
+            do {
+                Imgproc.approxPolyDP(c2f, approx, eps * peri, true)
+                eps *= 1.4
+            } while (approx.total() > 24 && eps < 0.05)
+            if (approx.total() < 4) {
+                approx.release(); c2f.release()
+                return null
+            }
+            val poly = approx.toArray()
+            approx.release()
+
+            // Clean page? Prefer the plain quad when it hugs the outline almost exactly.
+            for (qe in listOf(0.02, 0.03, 0.05)) {
+                val q = MatOfPoint2f()
+                Imgproc.approxPolyDP(c2f, q, qe * peri, true)
+                val isQuad = q.total() == 4L
+                val quadPts = if (isQuad) q.toArray() else null
+                q.release()
+                if (quadPts != null) {
+                    if (iou(bin.size(), quadPts, poly) >= QUAD_IOU) {
+                        c2f.release()
+                        return quadPts
+                    }
+                    break
+                }
+            }
+            c2f.release()
+            return poly
+        } catch (t: Throwable) {
+            return null
+        } finally {
+            bin.release()
+        }
+    }
+
+    /** Intersection-over-union of two filled polygons, rasterised at [size]. */
+    private fun iou(size: Size, a: Array<Point>, b: Array<Point>): Double {
+        val ma = Mat.zeros(size, CvType.CV_8UC1)
+        val mb = Mat.zeros(size, CvType.CV_8UC1)
+        Imgproc.fillPoly(ma, listOf(MatOfPoint(*a)), org.opencv.core.Scalar(255.0))
+        Imgproc.fillPoly(mb, listOf(MatOfPoint(*b)), org.opencv.core.Scalar(255.0))
+        val inter = Mat()
+        val union = Mat()
+        Core.bitwise_and(ma, mb, inter)
+        Core.bitwise_or(ma, mb, union)
+        val i = Core.countNonZero(inter).toDouble()
+        val u = Core.countNonZero(union).toDouble()
+        ma.release(); mb.release(); inter.release(); union.release()
+        return if (u > 0) i / u else 0.0
     }
 
     /** Pushes corners outward from the centroid so a little background remains. */

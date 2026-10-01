@@ -671,17 +671,24 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
         val hsv = Mat()
         Imgproc.cvtColor(rgb, hsv, Imgproc.COLOR_RGB2HSV)
 
-        // Primary: ML page segmentation; fallback: classical contour detection.
-        val quad = paperSegmenter.findPageQuad(src)
-            ?: DocumentDetector.findBestQuad(gray, hsv)
+        // Primary: ML page segmentation -> the paper's real OUTLINE (irregular polygon,
+        // or exactly 4 corners when the page is a clean rectangle). Fallback: classical
+        // contour detection, which can only produce a quad.
+        val polygon = paperSegmenter.findPagePolygon(src)
+        val shape: Array<Point>? = when {
+            polygon == null -> DocumentDetector.findBestQuad(gray, hsv)
+            // perspectiveCorrect expects [TL, TR, BR, BL], so order a 4-point result.
+            polygon.size == 4 -> DocumentDetector.orderCorners(polygon)
+            else -> polygon
+        }
 
         val results = mutableListOf<DetectedDoc>()
-        if (quad != null) {
-            val quadArea = Imgproc.contourArea(MatOfPoint2f(*quad))
-            val pts = quad.map {
+        if (shape != null) {
+            val shapeArea = Imgproc.contourArea(MatOfPoint2f(*shape))
+            val pts = shape.map {
                 floatArrayOf((it.x / detectScale).toFloat(), (it.y / detectScale).toFloat())
             }
-            results.add(DetectedDoc(pts, true, quadArea / (detectScale * detectScale)))
+            results.add(DetectedDoc(pts, shape.size == 4, shapeArea / (detectScale * detectScale)))
         }
 
         rgb.release(); gray.release(); hsv.release(); src.release(); srcFull.release()
