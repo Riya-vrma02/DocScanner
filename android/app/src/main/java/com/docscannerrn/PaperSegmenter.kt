@@ -331,13 +331,13 @@ class PaperSegmenter(private val context: Context) {
                 if (quadPts != null) {
                     if (iou(bin.size(), quadPts, poly) >= QUAD_IOU) {
                         c2f.release()
-                        return DocumentDetector.orderCorners(quadPts)
+                        return quadPts
                     }
                     break
                 }
             }
             c2f.release()
-            return if (poly.size == 4) DocumentDetector.orderCorners(poly) else poly
+            return poly
         } catch (t: Throwable) {
             return null
         } finally {

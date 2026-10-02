@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, PermissionsAndroid, Platform, ActivityIndicator, Alert,
+  View, Text, TouchableOpacity, StyleSheet, PermissionsAndroid, Platform, ActivityIndicator, Alert, Linking,
 } from 'react-native';
 import NativeDocumentScannerView, { CapturedDocument } from '../native/DocumentScannerView';
 
@@ -12,30 +12,33 @@ import NativeDocumentScannerView, { CapturedDocument } from '../native/DocumentS
  */
 export default function CameraScanScreen({ navigation }: any) {
   const [granted, setGranted] = useState<boolean | null>(null);
+  // True when Android reports NEVER_ASK_AGAIN — the system dialog won't show
+  // again, so the only way back is the app's Settings page.
+  const [blocked, setBlocked] = useState(false);
   const [captureNonce, setCaptureNonce] = useState(0);
   const [busy, setBusy] = useState(false);
 
+  async function requestPermission() {
+    if (Platform.OS !== 'android') {
+      setGranted(true);
+      return;
+    }
+    try {
+      const res = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA, {
+        title: 'Camera permission',
+        message: 'DocScanner needs the camera to scan documents.',
+        buttonPositive: 'OK',
+        buttonNegative: 'Cancel',
+      });
+      setGranted(res === PermissionsAndroid.RESULTS.GRANTED);
+      setBlocked(res === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN);
+    } catch {
+      setGranted(false);
+    }
+  }
+
   useEffect(() => {
-    (async () => {
-      if (Platform.OS !== 'android') {
-        setGranted(true);
-        return;
-      }
-      try {
-        const res = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.CAMERA,
-          {
-            title: 'Camera permission',
-            message: 'DocScanner needs the camera to scan documents.',
-            buttonPositive: 'OK',
-            buttonNegative: 'Cancel',
-          }
-        );
-        setGranted(res === PermissionsAndroid.RESULTS.GRANTED);
-      } catch {
-        setGranted(false);
-      }
-    })();
+    requestPermission();
   }, []);
 
   function onCaptured(e: { nativeEvent: CapturedDocument }) {
