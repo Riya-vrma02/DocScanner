@@ -160,7 +160,7 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
             // detector when the model is unavailable or finds no single quad.
             // Frames are dropped while this runs (STRATEGY_KEEP_ONLY_LATEST),
             // which naturally throttles the overlay to inference speed.
-            var quad = segmenter.findPageQuad(upright)
+            var quad = segmenter.findPagePolygon(upright)
             if (quad == null) {
                 val rgb = Mat(); Imgproc.cvtColor(upright, rgb, Imgproc.COLOR_RGBA2RGB)
                 val gray = Mat(); Imgproc.cvtColor(rgb, gray, Imgproc.COLOR_RGB2GRAY)
@@ -294,7 +294,7 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
         // Fallback: classical contour detection if the model is unavailable or
         // returns nothing usable. Both return coords in `src`'s space, which is
         // scaled back to full resolution below.
-        val mlQuad = segmenter.findPageQuad(src)
+        val mlQuad = segmenter.findPagePolygon(src)
         val quad = mlQuad ?: DocumentDetector.findBestQuad(gray, hsv)
 
         // Which detector actually produced these corners — reported to JS so a
@@ -427,7 +427,7 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
             path.close()
             canvas.drawPath(path, fillPaint)
             canvas.drawPath(path, linePaint)
-            for (p in q) canvas.drawCircle(p.x, p.y, 10f, dotPaint)
+            if (q.size==4) for (p in q) canvas.drawCircle(p.x, p.y, 10f, dotPaint)
         }
     }
 }

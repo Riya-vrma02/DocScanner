@@ -11,7 +11,6 @@ import { usePagesStore } from '../store/pagesStore';
  * points (route.params.corners); the user can fix it before cropping.
  *
  *  - Drag a green dot to move that point.
- *  - Drag a white midpoint dot to add a new point on that edge (for curves/tears).
  *  - Double-tap a green dot to remove it (minimum MIN_POINTS).
  *
  * While a point is dragged, a circular MAGNIFIER (loupe) shows a zoomed view
@@ -26,7 +25,7 @@ import { usePagesStore } from '../store/pagesStore';
  * best on the 4-point result.
  */
 type Pt = { x: number; y: number };
-type Hit = { type: 'vertex' | 'mid'; index: number };
+type Hit = { index: number };
 
 const LOUPE_SIZE = 150;
 const LOUPE_ZOOM = 2.4;
@@ -74,13 +73,7 @@ export default function CropScreen({ route, navigation }: any) {
     let bestD = HIT_RADIUS;
     for (let i = 0; i < pts.length; i++) {
       const d = Math.hypot(pts[i].x - p.x, pts[i].y - p.y);
-      if (d < bestD) { bestD = d; best = { type: 'vertex', index: i }; }
-    }
-    if (best) return best;
-    for (let i = 0; i < pts.length; i++) {
-      const n = pts[(i + 1) % pts.length];
-      const d = Math.hypot((pts[i].x + n.x) / 2 - p.x, (pts[i].y + n.y) / 2 - p.y);
-      if (d < bestD) { bestD = d; best = { type: 'mid', index: i }; }
+      if (d < bestD) { bestD = d; best = { index: i }; }
     }
     return best;
   }
@@ -115,20 +108,8 @@ export default function CropScreen({ route, navigation }: any) {
         const hit = hitTest(p);
         if (!hit) { dragRef.current = null; return; }
 
-        let index = hit.index;
-        if (hit.type === 'mid') {
-          const pts = cornersRef.current;
-          const a = pts[index];
-          const b = pts[(index + 1) % pts.length];
-          const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-          update([...pts.slice(0, index + 1), mid, ...pts.slice(index + 1)]);
-          index += 1;
-        }
-        dragRef.current = {
-          index,
-          start: cornersRef.current[index],
-          moved: hit.type === 'mid', // an inserted point is never treated as a tap
-        };
+        const index = hit.index;
+        dragRef.current = { index, start: cornersRef.current[index], moved: false };
         setActiveIndex(index);
       },
       onPanResponderMove: (_evt, g) => {
@@ -247,24 +228,7 @@ export default function CropScreen({ route, navigation }: any) {
               />
               <Polygon points={polyPoints} fill="none" stroke="#4CAF50" strokeWidth={2} />
 
-              {/* midpoint handles: drag to add a point */}
-              {corners.map((c, i) => {
-                const n = corners[(i + 1) % corners.length];
-                return (
-                  <Circle
-                    key={`m${i}`}
-                    cx={(c.x + n.x) / 2}
-                    cy={(c.y + n.y) / 2}
-                    r={7}
-                    fill="#fff"
-                    fillOpacity={0.85}
-                    stroke="#4CAF50"
-                    strokeWidth={2}
-                  />
-                );
-              })}
-
-              {/* vertex handles: drag to move, double-tap to remove */}
+              {/* point handles: drag to move, double-tap to remove */}
               {corners.map((c, i) => (
                 <Circle
                   key={`v${i}`}
@@ -289,7 +253,7 @@ export default function CropScreen({ route, navigation }: any) {
 
       <View style={styles.buttonBar}>
         <Text style={styles.hint}>
-          Drag dots to fit the edges. Drag a white dot to add a point. Double-tap a point to remove it.
+          Drag the dots to fit the edges. Double-tap a dot to remove it.
         </Text>
         <View style={styles.buttonRow}>
           <TouchableOpacity
