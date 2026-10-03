@@ -51,21 +51,6 @@ export const DocScannerNative = {
   ): Promise<string> => DocScannerModule.perspectiveCorrect(imagePath, corners, outputPath),
 
   /**
-   * Dewarps a page bounded by an arbitrary polygon (4+ points, curved edges
-   * allowed) into a clean rectangle.
-   *
-   * Generalises `perspectiveCorrect`: with exactly 4 points the result is the
-   * same perspective transform, but extra points along an edge act as curve
-   * control points, so bent/curled/torn edges are genuinely flattened rather
-   * than clipped (perspectiveCorrect) or just masked (cropToContour).
-   */
-  dewarpPolygon: (
-    imagePath: string,
-    points: { x: number; y: number }[],
-    outputPath: string
-  ): Promise<string> => DocScannerModule.dewarpPolygon(imagePath, points, outputPath),
-
-  /**
    * ML-based dewarping for curled/bent pages (e.g. a book page that won't
    * lie flat). This is a SEPARATE fix from perspectiveCorrect — perspective
    * correction only handles a flat page shot at an angle; this handles

@@ -43,8 +43,16 @@ class PaperSegmenter(private val context: Context) {
         private val STD = floatArrayOf(0.229f, 0.224f, 0.225f)
         private const val MODEL_ASSET = "paper_seg.onnx"
 
-        /** Push corners outward so a sliver of background is kept (reference: 1.10). */
-        private const val EXPAND_SCALE = 1.10
+        /**
+         * Corner expansion about the centroid. The upstream reference uses 1.10 to
+         * keep a sliver of background (it feeds an LLM prompt), but for a scanner
+         * that margin is harmful: the quad no longer sits on the page corners, so
+         * the perspective warp doesn't exactly rectify the page and the result
+         * looks slanted with background wedges around it. 1.0 = crop tight on the
+         * detected corners, which makes the warp straighten the page properly.
+         * Nudge slightly above 1.0 only if you see edges being shaved off.
+         */
+        private const val EXPAND_SCALE = 1.0
 
         /** A plain 4-corner shape is kept only if it matches the outline this closely (IoU). */
         private const val QUAD_IOU = 0.985

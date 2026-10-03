@@ -197,19 +197,43 @@ object DocumentDetector {
         }
     }
 
-    /** Orders 4 points as [top-left, top-right, bottom-right, bottom-left]. */
+    /**
+     * Orders 4 points as [top-left, top-right, bottom-right, bottom-left] with a
+     * guaranteed CLOCKWISE winding (in image coordinates, where y grows
+     * downward).
+     *
+     * This sorts the corners by their angle around the centroid rather than
+     * using the common min/max of (x+y) and (x-y) heuristic. That heuristic
+     * breaks down on a strongly rotated quad: it can label TR/BL incorrectly,
+     * or even pick the same point for two slots. Either case reverses the
+     * winding order relative to the destination rectangle, and
+     * getPerspectiveTransform then produces a MIRRORED (flipped) page.
+     *
+     * Sorting by angle makes the winding consistent by construction, so the
+     * warp can never come out mirrored no matter how the page is rotated; we
+     * then rotate the cycle so it begins at the top-left-most corner.
+     */
     fun orderCorners(points: Array<Point>): Array<Point> {
-        var tl = points[0]; var br = points[0]; var tr = points[0]; var bl = points[0]
-        var minSum = Double.MAX_VALUE; var maxSum = -Double.MAX_VALUE
-        var minDiff = Double.MAX_VALUE; var maxDiff = -Double.MAX_VALUE
-        for (p in points) {
-            val sum = p.x + p.y
-            val diff = p.x - p.y
-            if (sum < minSum) { minSum = sum; tl = p }
-            if (sum > maxSum) { maxSum = sum; br = p }
-            if (diff > maxDiff) { maxDiff = diff; tr = p }
-            if (diff < minDiff) { minDiff = diff; bl = p }
+        if (points.size != 4) return points
+
+        var cx = 0.0
+        var cy = 0.0
+        for (p in points) { cx += p.x; cy += p.y }
+        cx /= points.size
+        cy /= points.size
+
+        // Ascending atan2 with y pointing down traverses the quad clockwise,
+        // matching the destination rectangle's TL -> TR -> BR -> BL winding.
+        val clockwise = points.sortedBy { Math.atan2(it.y - cy, it.x - cx) }
+
+        // Start the cycle at the corner nearest the top-left of the image.
+        var startIdx = 0
+        var bestSum = Double.MAX_VALUE
+        for (i in clockwise.indices) {
+            val sum = clockwise[i].x + clockwise[i].y
+            if (sum < bestSum) { bestSum = sum; startIdx = i }
         }
-        return arrayOf(tl, tr, br, bl)
+
+        return Array(4) { clockwise[(startIdx + it) % 4] }
     }
 }

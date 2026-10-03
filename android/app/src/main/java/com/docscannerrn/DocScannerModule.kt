@@ -298,11 +298,18 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
             val bitmap = BitmapFactory.decodeFile(imagePath)
                 ?: return promise.reject("DECODE_FAILED", "Could not decode image")
 
-            val corners = (0 until cornersJs.size()).map {
+            val incoming = (0 until cornersJs.size()).map {
                 val m = cornersJs.getMap(it)!!
                 Point(m.getDouble("x"), m.getDouble("y"))
             }
-            require(corners.size == 4) { "Expected exactly 4 corners" }
+            require(incoming.size == 4) { "Expected exactly 4 corners" }
+
+            // Normalize the corner order (clockwise, starting top-left) before
+            // warping. The caller's order can't be trusted: dragging a handle
+            // past another in the crop UI reverses the winding, and a reversed
+            // winding against the fixed destination rectangle makes
+            // getPerspectiveTransform emit a MIRRORED page.
+            val corners = DocumentDetector.orderCorners(incoming.toTypedArray()).toList()
             val (tl, tr, br, bl) = corners
 
             val widthTop = dist(tl, tr); val widthBottom = dist(bl, br)
@@ -697,9 +704,18 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
 
     /**
      * Crops to an arbitrary (possibly non-convex, torn-edge) polygon instead
-     * of perspective-warping a quadrilateral: masks out everything outside
-     * the polygon to white, then crops to its bounding box. Use this for any
-     * document detectAllDocuments() reported as isQuadrilateral: false.
+     * of perspective-warping a quadrilateral: masks out everything outside the
+     * polygon to white, then DESKEWS so the page comes out upright.
+     *
+     * The deskew matters: a plain axis-aligned boundingRect() crop keeps
+     * whatever tilt the page had in the photo, so the exported PDF shows a
+     * slanted page. Instead we take the polygon's minimum-area (rotated)
+     * rectangle, rotate the image by that angle so the page edges become
+     * horizontal/vertical, and crop to the now-upright rectangle.
+     *
+     * Use this for any document detectAllDocuments() reported as
+     * isQuadrilateral: false (perspectiveCorrect handles the clean-quad case,
+     * which is already straightened by the homography).
      */
     @ReactMethod
     fun cropToContour(imagePath: String, pointsJs: ReadableArray, outputPath: String, promise: Promise) {
@@ -708,7 +724,7 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
                 ?: return promise.reject("DECODE_FAILED", "Could not decode image")
 
             val points = (0 until pointsJs.size()).map {
-                val m = pointsJs.getMap(it)!!
+                val m = pointsJs.getMap(it)
                 Point(m.getDouble("x"), m.getDouble("y"))
             }
 
@@ -723,14 +739,52 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
             val whiteBg = Mat(src.size(), src.type(), org.opencv.core.Scalar(255.0, 255.0, 255.0, 255.0))
             src.copyTo(whiteBg, mask)
 
-            val rect = Imgproc.boundingRect(matOfPoint)
-            val cropped = Mat(whiteBg, rect)
+            // Rotated bounding rect gives the page's actual tilt.
+            val poly2f = MatOfPoint2f(*points.toTypedArray())
+            val rr = Imgproc.minAreaRect(poly2f)
+            poly2f.release()
+
+            // Normalize to the smallest rotation that makes the page upright.
+            // OpenCV reports the angle in (0, 90]; past 45 degrees it's shorter
+            // to rotate the other way and swap width/height.
+            var angle = rr.angle
+            var rw = rr.size.width
+            var rh = rr.size.height
+            if (angle > 45.0) {
+                angle -= 90.0
+                val t = rw; rw = rh; rh = t
+            }
+
+            val deskewed: Mat
+            val center = rr.center
+            if (kotlin.math.abs(angle) < 0.3) {
+                // Already straight — skip the resample.
+                deskewed = whiteBg
+            } else {
+                deskewed = Mat()
+                val rot = Imgproc.getRotationMatrix2D(center, angle, 1.0)
+                Imgproc.warpAffine(
+                    whiteBg, deskewed, rot, whiteBg.size(), Imgproc.INTER_LINEAR,
+                    Core.BORDER_CONSTANT, org.opencv.core.Scalar(255.0, 255.0, 255.0, 255.0)
+                )
+                rot.release()
+            }
+
+            // Crop the upright rectangle around the (unmoved) center.
+            val x0 = (center.x - rw / 2.0).toInt().coerceIn(0, deskewed.cols() - 1)
+            val y0 = (center.y - rh / 2.0).toInt().coerceIn(0, deskewed.rows() - 1)
+            val x1 = (center.x + rw / 2.0).toInt().coerceIn(x0 + 1, deskewed.cols())
+            val y1 = (center.y + rh / 2.0).toInt().coerceIn(y0 + 1, deskewed.rows())
+            val roi = org.opencv.core.Rect(x0, y0, x1 - x0, y1 - y0)
+            val cropped = Mat(deskewed, roi)
 
             val result = Bitmap.createBitmap(cropped.cols(), cropped.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(cropped, result)
 
             writeJpeg(result, outputPath)
-            mask.release(); whiteBg.release(); src.release(); cropped.release()
+            mask.release(); src.release(); cropped.release()
+            if (deskewed !== whiteBg) deskewed.release()
+            whiteBg.release()
             promise.resolve(outputPath)
         } catch (e: Exception) {
             promise.reject("CROP_FAILED", e.message, e)
