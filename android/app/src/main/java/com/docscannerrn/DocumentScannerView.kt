@@ -160,7 +160,7 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
             // detector when the model is unavailable or finds no single quad.
             // Frames are dropped while this runs (STRATEGY_KEEP_ONLY_LATEST),
             // which naturally throttles the overlay to inference speed.
-            var quad = segmenter.findPagePolygon(upright)
+            var quad = segmenter.findPagePolygon(upright, live = true)
             if (quad == null) {
                 val rgb = Mat(); Imgproc.cvtColor(upright, rgb, Imgproc.COLOR_RGBA2RGB)
                 val gray = Mat(); Imgproc.cvtColor(rgb, gray, Imgproc.COLOR_RGB2GRAY)
@@ -179,7 +179,10 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
             } else {
                 // Keep the last box briefly to avoid flicker on a dropped detection.
                 missCount++
-                if (missCount >= 5) post { overlay.setQuad(null) }
+                if (missCount >= 5) {
+                    segmenter.resetSmoothing()
+                    post { overlay.setQuad(null) }
+                }
             }
 
             upright.release()
