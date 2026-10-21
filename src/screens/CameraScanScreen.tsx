@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, PermissionsAndroid, Platform, ActivityIndicator, Alert, Linking,
 } from 'react-native';
-import NativeDocumentScannerView, { CapturedDocument } from '../native/DocumentScannerView';
+import NativeDocumentScannerView, { CapturedDocument, DetectionState } from '../native/DocumentScannerView';
 
 /**
  * Live in-app scanner: shows the CameraX preview with a real-time edge overlay,
@@ -17,6 +17,14 @@ export default function CameraScanScreen({ navigation }: any) {
   const [blocked, setBlocked] = useState(false);
   const [captureNonce, setCaptureNonce] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [detection, setDetection] = useState<DetectionState>({
+    detected: false,
+    overlapping: false,
+    separateSheets: 0,
+    blobRectangularity: 1,
+    blobSolidity: 1,
+    splitApplied: false,
+  });
 
   async function requestPermission() {
     if (Platform.OS !== 'android') {
@@ -53,17 +61,37 @@ export default function CameraScanScreen({ navigation }: any) {
         imageHeight: doc.imageHeight,
       });
 
+    // The still is a different frame from the preview, so overlap can appear
+    // here even if the live state looked clean at the moment of the tap.
+    const checkOverlap = () => {
+      if (!doc.overlapping) {
+        go();
+        return;
+      }
+      Alert.alert(
+        'Only the top page was scanned',
+        'Overlapping pages were detected in this shot. The other pages were left out — separate them and scan again to capture each one.',
+        [
+          { text: 'Retake', style: 'cancel' },
+          { text: 'Keep it', onPress: go },
+        ]
+      );
+    };
+
     // ---- TEMP DIAGNOSTIC: is the ML segmenter actually being used? ----
+    // Chains into the overlap check rather than replacing it, so a detector
+    // fallback doesn't silently suppress the overlap warning.
     if (doc.detector !== 'ml') {
       Alert.alert(
         'Detector diagnostic',
         `detector: ${doc.detector}\nmodel: ${doc.segStatus}\nreason: ${doc.segError ?? 'none'}`,
-        [{ text: 'Continue', onPress: go }]
+        [{ text: 'Continue', onPress: checkOverlap }]
       );
       return;
     }
     // ---- END TEMP DIAGNOSTIC ----
-    go();
+
+    checkOverlap();
   }
 
   function onError(e: { nativeEvent: { message: string } }) {
@@ -71,10 +99,42 @@ export default function CameraScanScreen({ navigation }: any) {
     Alert.alert('Scanner error', e.nativeEvent?.message ?? 'Unknown error');
   }
 
-  function shoot() {
-    if (busy) return;
+  function onDetectionState(e: { nativeEvent: DetectionState }) {
+    setDetection(e.nativeEvent);
+  }
+
+  function doCapture() {
     setBusy(true);
     setCaptureNonce((n) => n + 1);
+  }
+
+  function shoot() {
+    if (busy) return;
+    // Capturing while sheets overlap silently drops everything but the top
+    // sheet, so confirm rather than let the user lose pages without knowing.
+    if (detection.overlapping) {
+      Alert.alert(
+        'Overlapping pages',
+        'The pages are stacked, so only the top one will be scanned. Separate them to scan each page.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Scan top page', onPress: doCapture },
+        ]
+      );
+      return;
+    }
+    doCapture();
+  }
+
+  /** Live guidance line under the preview. */
+  function statusText(): string {
+    if (busy) return 'Capturing…';
+    if (!detection.detected) return 'Align the document within the frame';
+    if (detection.overlapping) return 'Overlapping pages — separate them';
+    if (detection.separateSheets > 1) {
+      return `${detection.separateSheets} pages in frame — only the largest is scanned`;
+    }
+    return 'Page detected — tap to capture';
   }
 
   if (granted === null) {
@@ -113,9 +173,21 @@ export default function CameraScanScreen({ navigation }: any) {
         captureTrigger={captureNonce}
         onDocumentCaptured={onCaptured}
         onScannerError={onError}
+        onDetectionState={onDetectionState}
       />
       <View style={styles.hint} pointerEvents="none">
-        <Text style={styles.hintText}>Align the document within the frame</Text>
+        <Text style={[styles.hintText, detection.overlapping && styles.hintWarn]}>
+          {statusText()}
+        </Text>
+        {__DEV__ && (
+          // Temporary tuning readout: the overlap threshold is a guess until it
+          // can be compared against real values. Remove once tuned.
+          <Text style={styles.debugText}>
+            solid={detection.blobSolidity.toFixed(2)} rect=
+            {detection.blobRectangularity.toFixed(2)} split=
+            {detection.splitApplied ? 'yes' : 'no'} sep={detection.separateSheets}
+          </Text>
+        )}
       </View>
       <View style={styles.controls}>
         <TouchableOpacity style={styles.shutter} onPress={shoot} disabled={busy}>
@@ -131,7 +203,17 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#000', padding: 24 },
   msg: { color: '#fff', textAlign: 'center', marginBottom: 16 },
   hint: { position: 'absolute', top: 24, left: 0, right: 0, alignItems: 'center' },
-  hintText: { color: '#fff', backgroundColor: '#00000066', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12 },
+  hintText: {
+    color: '#fff', backgroundColor: '#00000066',
+    paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12,
+    overflow: 'hidden',
+  },
+  // Amber when sheets overlap, so it reads as a warning rather than guidance.
+  hintWarn: { backgroundColor: '#E65100dd', fontWeight: '600' },
+  debugText: {
+    marginTop: 6, color: '#7CFF7C', fontSize: 11,
+    backgroundColor: '#00000088', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8,
+  },
   controls: { position: 'absolute', bottom: 32, left: 0, right: 0, alignItems: 'center' },
   shutter: {
     width: 72, height: 72, borderRadius: 36, backgroundColor: '#ffffffcc',

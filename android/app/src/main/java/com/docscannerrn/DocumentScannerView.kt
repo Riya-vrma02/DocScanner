@@ -10,6 +10,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PointF
 import android.media.ExifInterface
+import android.util.Log
 import android.view.View
 import android.widget.FrameLayout
 import androidx.camera.core.AspectRatio
@@ -35,44 +36,88 @@ import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.MatOfPoint2f
+import org.opencv.core.MatOfPoint
 import org.opencv.core.Point
+import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.hypot
 import kotlin.math.max
 
 /**
  * In-app live document scanner. Hosts a CameraX preview, runs [PaperSegmenter]
- * (the paper_seg ONNX model) on analysis frames to draw a live edge overlay,
+ * (the paper_seg ONNX model) on analysis frames to draw a live outline overlay,
  * and on capture takes a full-resolution still, detects the page on it, and
- * emits `onDocumentCaptured` with the image path + corners so JS can hand it
- * to the existing CropScreen for manual fine-tuning.
+ * emits `onDocumentCaptured` with the image path + outline points so JS can
+ * hand it to the existing CropScreen for manual fine-tuning.
  *
- * [DocumentDetector] (classical CV) is the fallback whenever the model is
- * unavailable or can't fit a single quad.
+ * Changes vs. the previous version:
+ *  1. The live outline is smoothed (EMA, fixed vertex count for polygons) so a
+ *     many-point outline that wraps curved/torn edges does not jitter.
+ *  2. Capture honours what the user was looking at: if the still's own
+ *     detection disagrees with the last live outline (typical when the page lies
+ *     on a pile of other pages), the live outline is used instead of falling
+ *     back to the whole frame / the whole pile.
+ *  3. The classical CV detector is only used live when the model is unavailable
+ *     (see [CV_FALLBACK_ONLY_IF_MODEL_UNAVAILABLE]); on a pile it tends to
+ *     outline the entire stack and look like a successful detection.
+ *  4. Lifecycle/executor fix: a LifecycleRegistry cannot leave DESTROYED and a
+ *     shut-down executor rejects work, so after navigating away and back the
+ *     camera analysis and captures silently died. Both are recreated on attach.
  *
- * Implemented as its own LifecycleOwner so the camera starts/stops with the
- * view's attach/detach rather than the host Activity's lifecycle.
+ * [DocumentDetector] (classical CV) remains the fallback for the still.
  */
 @SuppressLint("ViewConstructor")
 class DocumentScannerView(private val reactCtx: ThemedReactContext) :
     FrameLayout(reactCtx), LifecycleOwner {
 
-    private val lifecycleRegistry = LifecycleRegistry(this)
+    companion object {
+        /**
+         * true : live preview uses DocumentDetector only if the ONNX model failed to load.
+         * false: also use it whenever the model returns nothing (old behaviour).
+         */
+        private const val CV_FALLBACK_ONLY_IF_MODEL_UNAVAILABLE = true
+
+        private const val TAG = "DocScannerView"
+
+        /** Draws a small text readout on the preview (outline source, point count, pile state). */
+        private const val DEBUG_HUD = false
+
+        /** A live outline older than this is not trusted as the capture fallback. */
+        private const val LIVE_FRESH_MS = 1500L
+
+        /** Still-detection and live outline must overlap at least this much (IoU) to be "in agreement". */
+        private const val LIVE_AGREE_IOU = 0.80
+
+        /** Vertex count polygons are resampled to for stable live smoothing. */
+        private const val OUTLINE_POINTS = 32
+
+        /** Weight of the newest frame in the outline EMA (lower = steadier, laggier). */
+        private const val SMOOTH_ALPHA = 0.5
+
+        /** If any vertex jumps more than this fraction of the frame diagonal, snap instead of smoothing. */
+        private const val SNAP_JUMP_FRACTION = 0.15
+    }
+
+    private var lifecycleRegistry = LifecycleRegistry(this)
     override val lifecycle: Lifecycle get() = lifecycleRegistry
 
     private val previewView = PreviewView(reactCtx)
     private val overlay = OverlayView(reactCtx)
-    private val executor = Executors.newSingleThreadExecutor()
+    private var executor = Executors.newSingleThreadExecutor()
 
     private var imageCapture: ImageCapture? = null
     private var lastCaptureTrigger = 0
     private val capturing = AtomicBoolean(false)
     private var missCount = 0
+    private var frameCount = 0
+
+    /** Last detection state pushed to JS, so identical states aren't re-sent. */
+    private var lastDetectionKey = ""
 
     /**
      * ML page segmentation (paper_seg.onnx). Used for both the live overlay and
@@ -80,6 +125,13 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
      * unavailable or can't fit a single quad.
      */
     private val segmenter = PaperSegmenter(reactCtx.applicationContext)
+
+    private val smoother = OutlineSmoother()
+
+    /** Last good live outline, normalised to 0..1 of the upright analysis frame. */
+    @Volatile private var lastLive: Array<Point>? = null
+    @Volatile private var lastLiveInfo = PaperSegmenter.SheetInfo(false, 0, 1.0, 1.0, false)
+    @Volatile private var lastLiveAt = 0L
 
     init {
         addView(previewView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
@@ -89,6 +141,21 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
+        // DESTROYED is terminal for a LifecycleRegistry, and a shut-down executor rejects
+        // all work, so both must be recreated when the view is re-attached.
+        if (lifecycleRegistry.currentState == Lifecycle.State.DESTROYED) {
+            lifecycleRegistry = LifecycleRegistry(this)
+        }
+        if (executor.isShutdown) {
+            executor = Executors.newSingleThreadExecutor()
+        }
+        capturing.set(false)
+        missCount = 0
+        lastDetectionKey = ""
+        lastLive = null
+        smoother.reset()
+        segmenter.resetSmoothing()
+
         lifecycleRegistry.currentState = Lifecycle.State.RESUMED
         startCamera()
     }
@@ -149,46 +216,112 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
     // ----- Live per-frame detection -----------------------------------------
 
     private fun analyzeFrame(image: ImageProxy) {
+        var upright: Mat? = null
         try {
             val rgba = rgbaToMat(image)
-            val upright = rotateUpright(rgba, image.imageInfo.rotationDegrees)
-            if (upright !== rgba) rgba.release()
+            val rotated = rotateUpright(rgba, image.imageInfo.rotationDegrees)
+            if (rotated !== rgba) rgba.release()
+            upright = rotated
 
-            // Prefer the ML segmentation model — classical CV can't reliably
-            // separate a page from a patterned/cluttered background (it kept
-            // locking onto a near-full-frame contour). Only fall back to the CV
-            // detector when the model is unavailable or finds no single quad.
-            // Frames are dropped while this runs (STRATEGY_KEEP_ONLY_LATEST),
-            // which naturally throttles the overlay to inference speed.
-            var quad = segmenter.findPagePolygon(upright, live = true)
-            if (quad == null) {
-                val rgb = Mat(); Imgproc.cvtColor(upright, rgb, Imgproc.COLOR_RGBA2RGB)
+            val fw = rotated.cols()
+            val fh = rotated.rows()
+
+            // Prefer the ML segmentation model. Frames are dropped while this runs
+            // (STRATEGY_KEEP_ONLY_LATEST), which throttles the overlay to inference speed.
+            var poly: Array<Point>? = segmenter.findPagePolygon(rotated, live = true)
+            var info = segmenter.lastSheetInfo
+            var usedCv = false
+
+            // Classical CV is a weak detector on piles (it outlines the whole stack and
+            // looks like a success), so by default it is only used when the model itself
+            // is unavailable.
+            val allowCv = !CV_FALLBACK_ONLY_IF_MODEL_UNAVAILABLE || segmenter.status == "unavailable"
+            if (poly == null && allowCv) {
+                val rgb = Mat(); Imgproc.cvtColor(rotated, rgb, Imgproc.COLOR_RGBA2RGB)
                 val gray = Mat(); Imgproc.cvtColor(rgb, gray, Imgproc.COLOR_RGB2GRAY)
                 val hsv = Mat(); Imgproc.cvtColor(rgb, hsv, Imgproc.COLOR_RGB2HSV)
-                quad = DocumentDetector.findBestQuad(gray, hsv)
+                poly = DocumentDetector.findBestQuad(gray, hsv)
+                usedCv = poly != null
                 rgb.release(); gray.release(); hsv.release()
+                info = PaperSegmenter.SheetInfo(false, 0, 1.0, 1.0, false)
             }
 
             val vw = width
             val vh = height
 
-            if (quad != null && vw > 0 && vh > 0) {
+            if (poly != null && vw > 0 && vh > 0) {
                 missCount = 0
-                val mapped = quad.map { mapToView(it, upright.cols(), upright.rows(), vw, vh) }.toTypedArray()
-                post { overlay.setQuad(mapped) }
+
+                val smooth = smoother.smooth(poly, hypot(fw.toDouble(), fh.toDouble()))
+
+                // Remember what the user is looking at, for the capture step.
+                if (!usedCv) {
+                    lastLive = Array(smooth.size) { Point(smooth[it].x / fw, smooth[it].y / fh) }
+                    lastLiveInfo = info
+                    lastLiveAt = System.currentTimeMillis()
+                }
+
+                if (++frameCount % 30 == 1) {
+                    Log.d(
+                        TAG,
+                        "outline: ${poly.size} pts raw, ${smooth.size} smoothed, " +
+                            "source=${if (usedCv) "CV (always 4 pts)" else "model"}"
+                    )
+                }
+
+                val mapped = smooth.map { mapToView(it, fw, fh, vw, vh) }.toTypedArray()
+                post { overlay.setOutline(mapped) }
+
+                if (DEBUG_HUD) {
+                    val dbg = "src=${if (usedCv) "CV (4 pts only)" else "model"}  raw=${poly.size}  " +
+                        "smooth=${smooth.size}\n${segmenter.lastDebug}" +
+                        (if (usedCv) "\nmodel err=${segmenter.lastError}" else "")
+                    post { overlay.setDebug(dbg) }
+                }
+
+                emitDetectionState(
+                    detected = true,
+                    overlapping = info.overlapping,
+                    separateSheets = info.separateSheets,
+                    blobRectangularity = info.blobRectangularity,
+                    blobSolidity = info.blobSolidity,
+                    splitApplied = info.splitApplied
+                )
             } else {
-                // Keep the last box briefly to avoid flicker on a dropped detection.
+                // Keep the last outline briefly to avoid flicker on a dropped detection.
                 missCount++
-                if (missCount >= 5) {
+                if (DEBUG_HUD) {
+                    val dbg = "NO OUTLINE  seg=${segmenter.status}  err=${segmenter.lastError}\n${segmenter.lastDebug}"
+                    post { overlay.setDebug(dbg) }
+                }
+                if (missCount % 30 == 1) {
+                    Log.w(
+                        TAG,
+                        "no outline: poly=${poly != null} view=${vw}x$vh " +
+                            "seg=${segmenter.status} err=${segmenter.lastError}"
+                    )
+                }
+                if (missCount >= 8) {
                     segmenter.resetSmoothing()
-                    post { overlay.setQuad(null) }
+                    smoother.reset()
+                    lastLive = null
+                    post { overlay.setOutline(null) }
+                    emitDetectionState(
+                        detected = false,
+                        overlapping = false,
+                        separateSheets = 0,
+                        blobRectangularity = 1.0,
+                        blobSolidity = 1.0,
+                        splitApplied = false
+                    )
                 }
             }
-
-            upright.release()
         } catch (e: Exception) {
-            // Ignore a single bad frame.
+            // A single bad frame is fine, but never fail silently: if this fires on
+            // every frame the overlay will never appear.
+            Log.w(TAG, "analyzeFrame failed: ${e::class.java.simpleName}: ${e.message}")
         } finally {
+            upright?.release()
             image.close()
         }
     }
@@ -251,14 +384,20 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
             ContextCompat.getMainExecutor(reactCtx),
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(result: ImageCapture.OutputFileResults) {
-                    executor.execute {
-                        try {
-                            processCaptured(file.absolutePath)
-                        } catch (e: Exception) {
-                            emitError(e.message ?: "capture processing failed")
-                        } finally {
-                            capturing.set(false)
+                    try {
+                        executor.execute {
+                            try {
+                                processCaptured(file.absolutePath)
+                            } catch (e: Exception) {
+                                emitError(e.message ?: "capture processing failed")
+                            } finally {
+                                capturing.set(false)
+                            }
                         }
+                    } catch (e: Exception) {
+                        // Executor already shut down (view detached mid-capture).
+                        capturing.set(false)
+                        emitError(e.message ?: "scanner is not running")
                     }
                 }
 
@@ -280,50 +419,98 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
         val fullH = bitmap.height
 
         val srcFull = Mat()
-        Utils.bitmapToMat(bitmap, srcFull)
-        val longEdge = max(srcFull.rows(), srcFull.cols()).toDouble()
-        val detectScale = if (longEdge > 800.0) 800.0 / longEdge else 1.0
         val src = Mat()
-        if (detectScale < 1.0) {
-            Imgproc.resize(srcFull, src, Size(srcFull.cols() * detectScale, srcFull.rows() * detectScale))
-        } else {
-            srcFull.copyTo(src)
+        val rgb = Mat()
+        val gray = Mat()
+        val hsv = Mat()
+        try {
+            Utils.bitmapToMat(bitmap, srcFull)
+            val longEdge = max(srcFull.rows(), srcFull.cols()).toDouble()
+            val detectScale = if (longEdge > 800.0) 800.0 / longEdge else 1.0
+            if (detectScale < 1.0) {
+                Imgproc.resize(srcFull, src, Size(srcFull.cols() * detectScale, srcFull.rows() * detectScale))
+            } else {
+                srcFull.copyTo(src)
+            }
+            Imgproc.cvtColor(src, rgb, Imgproc.COLOR_RGBA2RGB)
+            Imgproc.cvtColor(rgb, gray, Imgproc.COLOR_RGB2GRAY)
+            Imgproc.cvtColor(rgb, hsv, Imgproc.COLOR_RGB2HSV)
+
+            // 1) ML page segmentation on the still.
+            val mlPoly = segmenter.findPagePolygon(src)
+            val mlInfo = segmenter.lastSheetInfo
+
+            // 2) The outline the user was looking at just before pressing capture,
+            //    mapped into this still's coordinate space (both are upright, so
+            //    normalised coordinates carry over).
+            val liveSnap = lastLive
+            val live: Array<Point>? =
+                if (liveSnap != null && System.currentTimeMillis() - lastLiveAt < LIVE_FRESH_MS) {
+                    Array(liveSnap.size) { Point(liveSnap[it].x * src.cols(), liveSnap[it].y * src.rows()) }
+                } else null
+            val liveInfo = lastLiveInfo
+
+            // 3) Choose. The still's own result is more precise (higher res) but on a
+            //    pile it can flip to the whole stack or fail; when it disagrees with
+            //    what the user saw, trust the live outline.
+            var poly: Array<Point>?
+            var detector: String
+            var info = mlInfo
+
+            val mlAgrees = mlPoly != null &&
+                (live == null || polyIou(src.size(), mlPoly, live) >= LIVE_AGREE_IOU)
+
+            if (mlAgrees) {
+                poly = mlPoly
+                detector = "ml"
+            } else if (live != null) {
+                poly = live
+                detector = "live"
+                info = liveInfo
+            } else {
+                poly = DocumentDetector.findBestQuad(gray, hsv)
+                detector = if (poly != null) "cv" else "fullframe"
+            }
+
+            val corners: Array<DoubleArray> = if (poly != null) {
+                poly.map { doubleArrayOf(it.x / detectScale, it.y / detectScale) }.toTypedArray()
+            } else {
+                // Full-frame fallback so the user can still adjust manually.
+                arrayOf(
+                    doubleArrayOf(0.0, 0.0),
+                    doubleArrayOf(fullW.toDouble(), 0.0),
+                    doubleArrayOf(fullW.toDouble(), fullH.toDouble()),
+                    doubleArrayOf(0.0, fullH.toDouble())
+                )
+            }
+
+            emitCaptured(path, fullW, fullH, corners, detector, segmenter.status, segmenter.lastError, info)
+        } finally {
+            srcFull.release(); src.release(); rgb.release(); gray.release(); hsv.release()
+            bitmap.recycle()
         }
-        val rgb = Mat(); Imgproc.cvtColor(src, rgb, Imgproc.COLOR_RGBA2RGB)
-        val gray = Mat(); Imgproc.cvtColor(rgb, gray, Imgproc.COLOR_RGB2GRAY)
-        val hsv = Mat(); Imgproc.cvtColor(rgb, hsv, Imgproc.COLOR_RGB2HSV)
+    }
 
-        // Primary: ML page segmentation (robust on cluttered/bright backgrounds).
-        // Fallback: classical contour detection if the model is unavailable or
-        // returns nothing usable. Both return coords in `src`'s space, which is
-        // scaled back to full resolution below.
-        val mlQuad = segmenter.findPagePolygon(src)
-        val quad = mlQuad ?: DocumentDetector.findBestQuad(gray, hsv)
-
-        // Which detector actually produced these corners — reported to JS so a
-        // silent ML failure can't masquerade as poor detection.
-        val detector = when {
-            mlQuad != null -> "ml"
-            quad != null -> "cv"
-            else -> "fullframe"
+    /** Intersection-over-union of two filled polygons, rasterised at [size]. */
+    private fun polyIou(size: Size, a: Array<Point>, b: Array<Point>): Double {
+        val ma = Mat.zeros(size, CvType.CV_8UC1)
+        val mb = Mat.zeros(size, CvType.CV_8UC1)
+        val inter = Mat()
+        val union = Mat()
+        val pa = MatOfPoint(*a)
+        val pb = MatOfPoint(*b)
+        try {
+            Imgproc.fillPoly(ma, listOf(pa), Scalar(255.0))
+            Imgproc.fillPoly(mb, listOf(pb), Scalar(255.0))
+            Core.bitwise_and(ma, mb, inter)
+            Core.bitwise_or(ma, mb, union)
+            val i = Core.countNonZero(inter).toDouble()
+            val u = Core.countNonZero(union).toDouble()
+            return if (u > 0) i / u else 0.0
+        } finally {
+            ma.release(); mb.release(); inter.release(); union.release()
+            pa.release(); pb.release()
         }
-
-        val corners: Array<DoubleArray> = if (quad != null) {
-            quad.map { doubleArrayOf(it.x / detectScale, it.y / detectScale) }.toTypedArray()
-        } else {
-            // Full-frame fallback so the user can still adjust manually.
-            arrayOf(
-                doubleArrayOf(0.0, 0.0),
-                doubleArrayOf(fullW.toDouble(), 0.0),
-                doubleArrayOf(fullW.toDouble(), fullH.toDouble()),
-                doubleArrayOf(0.0, fullH.toDouble())
-            )
-        }
-
-        srcFull.release(); src.release(); rgb.release(); gray.release(); hsv.release()
-        bitmap.recycle()
-
-        emitCaptured(path, fullW, fullH, corners, detector, segmenter.status, segmenter.lastError)
     }
 
     /** Bakes EXIF orientation into the pixels so downstream coords are consistent. */
@@ -365,7 +552,8 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
         corners: Array<DoubleArray>,
         detector: String,
         segStatus: String,
-        segError: String?
+        segError: String?,
+        info: PaperSegmenter.SheetInfo
     ) {
         val cornerArray: WritableArray = Arguments.createArray()
         for (c in corners) {
@@ -378,11 +566,51 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
         event.putString("path", path)
         event.putInt("imageWidth", w)
         event.putInt("imageHeight", h)
+        // 4 points for a clean page, up to OUTLINE_POINTS when the outline is a real polygon.
         event.putArray("corners", cornerArray)
         event.putString("detector", detector)
         event.putString("segStatus", segStatus)
         event.putString("segError", segError)
+        // Overlap verdict for THIS capture, so the user can be told that only the
+        // top sheet made it into the scan.
+        event.putBoolean("overlapping", info.overlapping)
+        event.putInt("separateSheets", info.separateSheets)
+        event.putDouble("blobRectangularity", info.blobRectangularity)
+        event.putDouble("blobSolidity", info.blobSolidity)
+        event.putBoolean("splitApplied", info.splitApplied)
         dispatch("onDocumentCaptured", event)
+    }
+
+    /**
+     * Live sheet state for the preview UI. Only dispatched when it actually
+     * changes — the analyzer runs continuously and re-sending an identical
+     * state every frame would flood the bridge.
+     */
+    private fun emitDetectionState(
+        detected: Boolean,
+        overlapping: Boolean,
+        separateSheets: Int,
+        blobRectangularity: Double,
+        blobSolidity: Double,
+        splitApplied: Boolean
+    ) {
+        // Rectangularity is continuous and would differ every single frame, which
+        // would defeat the throttle entirely. Bucket it for the comparison key and
+        // send the precise value only when something else also changed.
+        val bucket = (blobRectangularity * 20).toInt()
+        val sBucket = (blobSolidity * 20).toInt()
+        val key = "$detected|$overlapping|$separateSheets|$bucket|$sBucket|$splitApplied"
+        if (key == lastDetectionKey) return
+        lastDetectionKey = key
+
+        val event: WritableMap = Arguments.createMap()
+        event.putBoolean("detected", detected)
+        event.putBoolean("overlapping", overlapping)
+        event.putInt("separateSheets", separateSheets)
+        event.putDouble("blobRectangularity", blobRectangularity)
+        event.putDouble("blobSolidity", blobSolidity)
+        event.putBoolean("splitApplied", splitApplied)
+        dispatch("onDetectionState", event)
     }
 
     private fun emitError(message: String) {
@@ -397,14 +625,128 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
             .receiveEvent(id, name, event)
     }
 
+    // ----- Outline smoothing -------------------------------------------------
+
+    /**
+     * Temporal smoothing for the live outline.
+     *
+     * - 4-point outlines: corners are aligned to the previous frame's order and averaged.
+     * - Polygons (5+ points): resampled to a fixed [OUTLINE_POINTS] vertices at even arc
+     *   length, wound clockwise, rotated to best match the previous frame, then averaged.
+     *   A varying vertex count would otherwise make the outline shimmer.
+     * - A sudden large move (different page, camera swing) snaps instead of smoothing.
+     *
+     * Only touched from the analysis executor thread (and reset before the camera starts).
+     */
+    private class OutlineSmoother {
+        private var prev: Array<Point>? = null
+
+        fun reset() {
+            prev = null
+        }
+
+        fun smooth(raw: Array<Point>, frameDiag: Double): Array<Point> {
+            // Keep the model's own vertices (no resampling): resampling to evenly spaced
+            // points chamfers every sharp corner and made the outline look distorted.
+            val cur: Array<Point> = if (raw.size <= 4) raw else clockwise(raw)
+
+            val p = prev
+            if (p == null || p.size != cur.size) {
+                prev = cur
+                return cur
+            }
+
+            val aligned = rotateToMatch(cur, p)
+
+            var maxJump = 0.0
+            for (i in aligned.indices) {
+                val d = hypot(aligned[i].x - p[i].x, aligned[i].y - p[i].y)
+                if (d > maxJump) maxJump = d
+            }
+            if (maxJump > SNAP_JUMP_FRACTION * frameDiag) {
+                prev = aligned
+                return aligned
+            }
+
+            val out = Array(aligned.size) { i ->
+                Point(
+                    p[i].x + (aligned[i].x - p[i].x) * SMOOTH_ALPHA,
+                    p[i].y + (aligned[i].y - p[i].y) * SMOOTH_ALPHA
+                )
+            }
+            prev = out
+            return out
+        }
+
+        /** Same winding every frame (image coords, y down: positive area = clockwise on screen). */
+        private fun clockwise(poly: Array<Point>): Array<Point> {
+            var area = 0.0
+            for (i in poly.indices) {
+                val a = poly[i]
+                val b = poly[(i + 1) % poly.size]
+                area += a.x * b.y - b.x * a.y
+            }
+            return if (area < 0) poly.reversedArray() else poly
+        }
+
+        /** [n] points spaced evenly along the closed outline's perimeter. */
+        private fun resampleClosed(poly: Array<Point>, n: Int): Array<Point> {
+            val m = poly.size
+            val segLen = DoubleArray(m) { i ->
+                val a = poly[i]
+                val b = poly[(i + 1) % m]
+                hypot(b.x - a.x, b.y - a.y)
+            }
+            val total = segLen.sum()
+            if (total < 1e-6) return poly
+
+            val out = ArrayList<Point>(n)
+            var i = 0
+            var acc = 0.0
+            for (k in 0 until n) {
+                val target = total * k / n
+                while (i < m - 1 && acc + segLen[i] < target) {
+                    acc += segLen[i]
+                    i++
+                }
+                val a = poly[i]
+                val b = poly[(i + 1) % m]
+                val t = if (segLen[i] > 1e-9) (target - acc) / segLen[i] else 0.0
+                out.add(Point(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t))
+            }
+            return out.toTypedArray()
+        }
+
+        /** Cyclic shift of [cur] that lines up best with [ref], so vertex i tracks vertex i. */
+        private fun rotateToMatch(cur: Array<Point>, ref: Array<Point>): Array<Point> {
+            val n = cur.size
+            var bestShift = 0
+            var bestCost = Double.MAX_VALUE
+            for (s in 0 until n) {
+                var cost = 0.0
+                for (i in 0 until n) {
+                    val a = cur[(i + s) % n]
+                    val b = ref[i]
+                    cost += hypot(a.x - b.x, a.y - b.y)
+                }
+                if (cost < bestCost) {
+                    bestCost = cost
+                    bestShift = s
+                }
+            }
+            return Array(n) { cur[(it + bestShift) % n] }
+        }
+    }
+
     // ----- Overlay view ------------------------------------------------------
 
     private class OverlayView(context: android.content.Context) : View(context) {
-        private var quad: Array<PointF>? = null
+        private var outline: Array<PointF>? = null
         private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#4CAF50")
             style = Paint.Style.STROKE
             strokeWidth = 5f
+            strokeJoin = Paint.Join.MITER
         }
         private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.parseColor("#334CAF50")
@@ -415,22 +757,47 @@ class DocumentScannerView(private val reactCtx: ThemedReactContext) :
             style = Paint.Style.FILL
         }
 
-        fun setQuad(q: Array<PointF>?) {
-            quad = q
+        private var debugText: String = ""
+        private val debugPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 30f
+            setShadowLayer(4f, 0f, 0f, Color.BLACK)
+        }
+
+        fun setOutline(q: Array<PointF>?) {
+            outline = q
+            invalidate()
+        }
+
+        fun setDebug(text: String) {
+            debugText = text
             invalidate()
         }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            val q = quad ?: return
-            if (q.size < 4) return
+
+            if (debugText.isNotEmpty()) {
+                var y = 60f
+                for (line in debugText.split("\n")) {
+                    canvas.drawText(line, 16f, y, debugPaint)
+                    y += 38f
+                }
+            }
+
+            val q = outline ?: return
+            if (q.size < 3) return
+
+            // Straight segments between the real vertices: rounding corners through edge
+            // midpoints made the outline drift away from the page edge.
             val path = Path()
             path.moveTo(q[0].x, q[0].y)
             for (i in 1 until q.size) path.lineTo(q[i].x, q[i].y)
             path.close()
+
             canvas.drawPath(path, fillPaint)
             canvas.drawPath(path, linePaint)
-            if (q.size==4) for (p in q) canvas.drawCircle(p.x, p.y, 10f, dotPaint)
+            if (q.size == 4) for (p in q) canvas.drawCircle(p.x, p.y, 10f, dotPaint)
         }
     }
 }

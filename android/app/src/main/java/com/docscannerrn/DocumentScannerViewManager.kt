@@ -27,5 +27,6 @@ class DocumentScannerViewManager : SimpleViewManager<DocumentScannerView>() {
         MapBuilder.builder<String, Any>()
             .put("onDocumentCaptured", MapBuilder.of("registrationName", "onDocumentCaptured"))
             .put("onScannerError", MapBuilder.of("registrationName", "onScannerError"))
+            .put("onDetectionState", MapBuilder.of("registrationName", "onDetectionState"))
             .build()
 }
