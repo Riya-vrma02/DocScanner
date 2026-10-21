@@ -32,10 +32,38 @@ import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import org.opencv.photo.Photo
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.max
 import kotlin.math.min
+
+// ---- shadow-removal tuning (see removeShadowsFrom) ----
+/** Ink is darkened only below this fraction of its local background (x255). */
+private const val INK_KNEE = 230.0
+/** Ink-darkening strength below the knee (1.0 = off, higher = darker text). */
+private const val INK_GAMMA = 1.4
+/** Lab colour distance from the paper colour above which a region counts as coloured content. */
+private const val CHROMA_T = 10.0
+/** Max chromaticity spread for a region to count as a FLAT colour (box, highlight, band). */
+private const val FLAT_CHROM = 0.03
+/**
+ * A colour region whose colour changes less than this (max channel, 0..255) across its own edge is a
+ * soft-edged SHADOW (its edge lies inside a gradual penumbra), not printed colour, which has a crisp step.
+ */
+private const val SOFT_STEP = 8.0
+/**
+ * Ink-removal kernel = long side / this. Must be wider than pen strokes but narrower than thin
+ * shadows (a cable's shadow is only a few % of the page wide). Lower = removes thicker strokes.
+ */
+private const val INK_DIV = 120
+/**
+ * Contrast of the default "Auto" filter, stretched around white (1.0 = none). Paper stays white,
+ * ink gets darker as this rises. Lower = softer, more natural-looking scan.
+ */
+private const val AUTO_CONTRAST = 1.1f
+/** Saturation applied after the Auto stretch to cancel the colour boost it causes (1.0 = none). */
+private const val AUTO_SATURATION = 0.87f
 
 /**
  * Replaces three third-party npm packages with one native module built entirely
@@ -334,7 +362,8 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
             Utils.matToBitmap(dst, result)
             src.release(); dst.release(); transform.release()
 
-            writeJpeg(result, outputPath)
+            // Every cropped page is cleaned once here, before it reaches the filter screen.
+            writeJpeg(removeShadowsFrom(result), outputPath)
             promise.resolve(outputPath)
         } catch (e: Exception) {
             promise.reject("WARP_FAILED", e.message, e)
@@ -376,7 +405,8 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
 
             src.release(); mask.release(); masked.release(); cropped.release()
 
-            writeJpeg(result, outputPath)
+            // Every cropped page is cleaned once here, before it reaches the filter screen.
+            writeJpeg(removeShadowsFrom(result), outputPath)
             promise.resolve(outputPath)
         } catch (e: Exception) {
             promise.reject("CROP_FAILED", e.message, e)
@@ -412,6 +442,7 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
                 bitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
             }
 
+
             val matrix = ColorMatrix()
             when (filterType) {
                 "GRAYSCALE" -> matrix.setSaturation(0f)
@@ -426,13 +457,20 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
                     matrix.postConcat(highContrast)
                 }
                 "AUTO_ENHANCE" -> {
+                    // The cropped page has already had its shadows removed, so its paper is pure
+                    // white; brightening would only wash out light text. Instead stretch contrast
+                    // AROUND WHITE:  out = 255 - (255 - in) * c  ->  paper stays 255, ink darker.
+                    val c = AUTO_CONTRAST
+                    val o = 255f * (1f - c)
                     val enhance = ColorMatrix(floatArrayOf(
-                        1.2f, 0f, 0f, 0f, 10f,
-                        0f, 1.2f, 0f, 0f, 10f,
-                        0f, 0f, 1.2f, 0f, 10f,
+                        c, 0f, 0f, 0f, o,
+                        0f, c, 0f, 0f, o,
+                        0f, 0f, c, 0f, o,
                         0f, 0f, 0f, 1f, 0f
                     ))
                     matrix.postConcat(enhance)
+                    // The contrast stretch above also boosts saturation; pull it back so colours stay true.
+                    matrix.postConcat(ColorMatrix().apply { setSaturation(AUTO_SATURATION) })
                 }
                 else -> {}
             }
@@ -459,6 +497,358 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
         } catch (e: Exception) {
             promise.reject("FILTER_FAILED", e.message, e)
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // SHADOW REMOVAL (colour-preserving) — runs once on every cropped page
+    // ---------------------------------------------------------------------
+    /**
+     * Removes shadows and uneven lighting from a page photo while keeping its COLOURS.
+     *
+     * Model: image = lighting x page, where the lighting has a brightness AND a colour (shadows are
+     * often tinted: light bounced off a hand, a table or warm room light). Paper is white, so on bare
+     * paper the lighting is simply the paper's own colour; under coloured content the lighting colour
+     * is taken from the paper around it. Dividing by that removes shadows and their colour casts while
+     * keeping printed colours.
+     *
+     *  1. Text-free background: on a copy downscaled to <= 1024 px, a morphological CLOSE with a disc
+     *     wider than a text stroke erases dark ink; a median filter removes specks.
+     *  2. Content mask: background pixels whose Lab colour differs from the paper colour (tinted boxes,
+     *     highlights, photos, colour bands) or that are very dark. Soft-edged regions are dropped: a
+     *     tinted shadow differs in colour too, but its edge is a gradual penumbra with no step across
+     *     it. Regions that nearly fill their bounding rectangle are filled as rectangles.
+     *  3. Lighting map:
+     *     - bare paper: its own brightness;
+     *     - under colour: the BRIGHTEST surrounding paper (grey dilation = max filter), so coloured
+     *       areas are never brightened more than the lit paper beside them (no blow-outs);
+     *     - FLAT colour regions (near-constant chromaticity, measured after an OPENING that removes
+     *       white text): their own brightness variation is lighting, so it is divided out as well.
+     *  4. out = in * gain, with a gain PER CHANNEL = 255 / lighting colour (paper -> white, casts gone).
+     *  5. Ink is darkened relative to its LOCAL background (luminance only), so faint text stays
+     *     readable while colour blocks — their own background — keep their tone.
+     *  6. Hue-preserving clip: a pixel that would exceed 255 is scaled down as a whole.
+     */
+    private fun removeShadowsFrom(src: Bitmap): Bitmap {
+        val rgba = Mat()
+        Utils.bitmapToMat(src.copy(Bitmap.Config.ARGB_8888, false), rgba)
+        val rgb = Mat()
+        Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
+        rgba.release()
+        val w = rgb.cols()
+        val h = rgb.rows()
+        val scale = min(1.0, 1024.0 / max(w, h))
+        val sw = max(1, (w * scale).toInt())
+        val sh = max(1, (h * scale).toInt())
+        val ns = sw * sh
+
+        val small = Mat()
+        Imgproc.resize(rgb, small, Size(sw.toDouble(), sh.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+        val k = max(7, (max(sw, sh) / 60) or 1)
+        val ker = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(k.toDouble(), k.toDouble()))
+
+        // 1) text-free colour background. The ink kernel is small: just wider than pen strokes, so thin
+        //    shadows (e.g. a cable lying across the page) stay in the background and get removed.
+        val ki = max(5, (max(sw, sh) / INK_DIV) or 1)
+        val keri = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(ki.toDouble(), ki.toDouble()))
+        val bgc = Mat()
+        Imgproc.morphologyEx(small, bgc, Imgproc.MORPH_CLOSE, keri)
+        Imgproc.medianBlur(bgc, bgc, ki)
+        keri.release()
+        small.release()
+
+        val lab = Mat(); Imgproc.cvtColor(bgc, lab, Imgproc.COLOR_RGB2Lab)
+        val grayM = Mat(); Imgproc.cvtColor(bgc, grayM, Imgproc.COLOR_RGB2GRAY)
+        val labB = ByteArray(ns * 3); lab.get(0, 0, labB); lab.release()
+        val gB = ByteArray(ns); grayM.get(0, 0, gB); grayM.release()
+        val bgB = ByteArray(ns * 3); bgc.get(0, 0, bgB)
+        val L = FloatArray(ns) { (gB[it].toInt() and 0xFF).toFloat() }
+
+        // 2) paper colour = brightest 10% of the background
+        val p90 = histPercentile(gB, 0.90)
+        val bright = BooleanArray(ns) { L[it] >= p90 }
+        val pa = maskedMedian(labB, 3, 1, bright)
+        val pb = maskedMedian(labB, 3, 2, bright)
+        val paperL = histPercentile(gB, 0.95)
+
+        val content = Mat(sh, sw, CvType.CV_8UC1)
+        val cB = ByteArray(ns)
+        for (i in 0 until ns) {
+            val da = (labB[i * 3 + 1].toInt() and 0xFF) - pa
+            val db = (labB[i * 3 + 2].toInt() and 0xFF) - pb
+            if (Math.hypot(da, db) > CHROMA_T || L[i] < 0.30 * paperL) cB[i] = 255.toByte()
+        }
+        content.put(0, 0, cB)
+        dropSoftRegions(content, bgB, sw, sh, k, ker)
+        Imgproc.dilate(content, content, ker)
+        run {
+            val contours = mutableListOf<MatOfPoint>()
+            val hier = Mat()
+            Imgproc.findContours(content.clone(), contours, hier, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+            hier.release()
+            for (cnt in contours) {
+                val area = Imgproc.contourArea(cnt)
+                if (area >= k * k) {
+                    val c2f = MatOfPoint2f(*cnt.toArray())
+                    val rr = Imgproc.minAreaRect(c2f)
+                    c2f.release()
+                    val ra = rr.size.width * rr.size.height
+                    if (ra > 0 && area / ra >= 0.6) {
+                        val pts = arrayOfNulls<Point>(4)
+                        rr.points(pts)
+                        Imgproc.fillConvexPoly(content, MatOfPoint(*pts.requireNoNulls()), Scalar(255.0))
+                    }
+                }
+                cnt.release()
+            }
+        }
+        content.get(0, 0, cB)
+        val isPaper = BooleanArray(ns) { cB[it].toInt() == 0 }
+        val paperCount = isPaper.count { it }
+
+        // 3) lighting COLOUR map (per channel)
+        val bgf = FloatArray(ns * 3) { (bgB[it].toInt() and 0xFF).toFloat() }
+        val illumC = bgf.copyOf()                 // bare paper: its own colour = the light's colour
+        if (paperCount > 0.05 * ns) {
+            // Under coloured areas: brightest surrounding paper, per channel (grey dilation = max filter)
+            val fillM = Mat(sh, sw, CvType.CV_32FC3)
+            fillM.put(0, 0, FloatArray(ns * 3) { if (isPaper[it / 3]) bgf[it] else 0f })
+            val known = Mat(sh, sw, CvType.CV_8UC1)
+            known.put(0, 0, ByteArray(ns) { if (isPaper[it]) 1 else 0 })
+            val hole = Mat(); val grown = Mat(); val knownD = Mat(); val newly = Mat()
+            var r = k
+            while (r < max(sw, sh)) {
+                Core.compare(known, Scalar(0.0), hole, Core.CMP_EQ)
+                if (Core.countNonZero(hole) == 0) break
+                val ker2 = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(2.0 * r + 1, 2.0 * r + 1))
+                Imgproc.dilate(fillM, grown, ker2)
+                Imgproc.dilate(known, knownD, ker2)
+                Core.bitwise_and(hole, knownD, newly)
+                grown.copyTo(fillM, newly)
+                known.setTo(Scalar(1.0), newly)
+                ker2.release()
+                r *= 2
+            }
+            hole.release(); grown.release(); knownD.release(); newly.release(); known.release()
+            Imgproc.GaussianBlur(fillM, fillM, Size(0.0, 0.0), max(sw, sh) / 30.0)
+            val fill = FloatArray(ns * 3); fillM.get(0, 0, fill); fillM.release()
+            val fillL = FloatArray(ns) { (0.299 * fill[it * 3] + 0.587 * fill[it * 3 + 1] + 0.114 * fill[it * 3 + 2]).toFloat() }
+            for (i in 0 until ns) if (!isPaper[i]) for (c in 0..2) illumC[i * 3 + c] = max(fill[i * 3 + c], bgf[i * 3 + c])
+
+            // flat colour regions: their own brightness variation is lighting too
+            val bgo = Mat(); Imgproc.morphologyEx(bgc, bgo, Imgproc.MORPH_OPEN, ker)
+            val loM = Mat(); Imgproc.cvtColor(bgo, loM, Imgproc.COLOR_RGB2GRAY)
+            val oB = ByteArray(ns * 3); bgo.get(0, 0, oB); bgo.release()
+            val loB = ByteArray(ns); loM.get(0, 0, loB); loM.release()
+            val core0 = Mat(); Imgproc.erode(content, core0, ker)
+            val c0B = ByteArray(ns); core0.get(0, 0, c0B); core0.release()
+            val labels = Mat()
+            val nl = Imgproc.connectedComponents(content, labels, 8, CvType.CV_32S)
+            val lbl = IntArray(ns); labels.get(0, 0, lbl); labels.release()
+            if (nl > 1) {
+                val regCount = IntArray(nl); val coreCount = IntArray(nl)
+                val s1 = DoubleArray(nl); val q1 = DoubleArray(nl); val s2 = DoubleArray(nl); val q2 = DoubleArray(nl)
+                val hist = Array(nl) { IntArray(256) }
+                val isCore = BooleanArray(ns)
+                for (i in 0 until ns) {
+                    val l = lbl[i]
+                    if (l == 0) continue
+                    regCount[l]++
+                    val lo = loB[i].toInt() and 0xFF
+                    if (c0B[i].toInt() != 0 && lo > 0.2 * paperL) {
+                        isCore[i] = true
+                        coreCount[l]++
+                        val rr = (oB[i * 3].toInt() and 0xFF) + 1.0
+                        val gg = (oB[i * 3 + 1].toInt() and 0xFF) + 1.0
+                        val bb = (oB[i * 3 + 2].toInt() and 0xFF) + 1.0
+                        val t = rr + gg + bb
+                        val cb = bb / t; val cg = gg / t
+                        s1[l] += cb; q1[l] += cb * cb; s2[l] += cg; q2[l] += cg * cg
+                        hist[l][lo]++
+                    }
+                }
+                val flat = BooleanArray(nl)
+                val lmax = DoubleArray(nl)
+                for (l in 1 until nl) {
+                    val n = coreCount[l]
+                    if (regCount[l] < k * k || n < k * k) continue
+                    val sd1 = Math.sqrt(max(0.0, q1[l] / n - (s1[l] / n) * (s1[l] / n)))
+                    val sd2 = Math.sqrt(max(0.0, q2[l] / n - (s2[l] / n) * (s2[l] / n)))
+                    if (max(sd1, sd2) > FLAT_CHROM) continue
+                    flat[l] = true
+                    var acc = 0; var v = 255
+                    for (b in 0..255) { acc += hist[l][b]; if (acc >= 0.95 * n) { v = b; break } }
+                    lmax[l] = v.toDouble()
+                }
+                val topVals = Array(nl) { ArrayList<Float>() }
+                for (i in 0 until ns) {
+                    val l = lbl[i]
+                    if (l != 0 && flat[l] && isCore[i] && (loB[i].toInt() and 0xFF) >= lmax[l] * 0.97) topVals[l].add(fillL[i])
+                }
+                val pLevel = DoubleArray(nl) { l ->
+                    val vs = topVals[l]
+                    if (vs.isEmpty()) paperL else { vs.sort(); vs[vs.size / 2].toDouble() }
+                }
+                for (i in 0 until ns) {
+                    val l = lbl[i]
+                    if (l == 0 || !flat[l]) continue
+                    if (isCore[i]) {
+                        // lighting relative to the envelope, applied to the envelope's colour
+                        val sfac = ((loB[i].toInt() and 0xFF) * (pLevel[l] / max(lmax[l], 1.0))) / max(fillL[i].toDouble(), 1.0)
+                        for (c in 0..2) illumC[i * 3 + c] = max(1.0, fill[i * 3 + c] * sfac).toFloat()
+                    } else {
+                        for (c in 0..2) illumC[i * 3 + c] = bgf[i * 3 + c]   // margin is (mostly) paper
+                    }
+                }
+            }
+        } else {
+            // nothing to go on: one global lighting colour from the paper
+            val pc = FloatArray(3) { c -> maskedMedian(bgB, 3, c, bright).toFloat() }
+            for (i in 0 until ns) for (c in 0..2) illumC[i * 3 + c] = pc[c]
+        }
+        // Smooth the lighting map ONLY around coloured content, to hide seams there. On bare paper the
+        // background is already smooth, and blurring it would smear sharp shadow edges (a cable's
+        // shadow, say) and leave a grey outline along them.
+        val nearM = Mat()
+        Imgproc.dilate(content, nearM, ker)
+        val nearB = ByteArray(ns); nearM.get(0, 0, nearB); nearM.release()
+        content.release(); ker.release(); bgc.release()
+
+        val illumM = Mat(sh, sw, CvType.CV_32FC3)
+        illumM.put(0, 0, illumC)
+        Imgproc.GaussianBlur(illumM, illumM, Size(0.0, 0.0), k / 4.0)
+        val blurred = FloatArray(ns * 3); illumM.get(0, 0, blurred); illumM.release()
+        for (i in 0 until ns) if (nearB[i].toInt() != 0) for (c in 0..2) illumC[i * 3 + c] = blurred[i * 3 + c]
+
+        // 4) per-channel gain; corrected background brightness for the ink step
+        val gainS = FloatArray(ns * 3) { (255.0 / max(illumC[it].toDouble(), 1.0)).coerceIn(1.0, 4.0).toFloat() }
+        val bgYS = FloatArray(ns) { i ->
+            val r = min(255.0, bgf[i * 3] * gainS[i * 3].toDouble())
+            val g = min(255.0, bgf[i * 3 + 1] * gainS[i * 3 + 1].toDouble())
+            val b = min(255.0, bgf[i * 3 + 2] * gainS[i * 3 + 2].toDouble())
+            (0.299 * r + 0.587 * g + 0.114 * b).coerceIn(1.0, 255.0).toFloat()
+        }
+
+        // 5+6) full-resolution pass, row by row (the small maps are sampled bilinearly)
+        val kr = INK_KNEE / 255.0
+        val row = ByteArray(w * 3)
+        val fx = sw.toDouble() / w
+        val fy = sh.toDouble() / h
+        for (y in 0 until h) {
+            rgb.get(y, 0, row)
+            val syf = ((y + 0.5) * fy - 0.5).coerceIn(0.0, (sh - 1).toDouble())
+            val y0 = syf.toInt(); val y1 = min(y0 + 1, sh - 1); val ty = syf - y0
+            for (x in 0 until w) {
+                val sxf = ((x + 0.5) * fx - 0.5).coerceIn(0.0, (sw - 1).toDouble())
+                val x0 = sxf.toInt(); val x1 = min(x0 + 1, sw - 1); val tx = sxf - x0
+                val i00 = y0 * sw + x0; val i01 = y0 * sw + x1; val i10 = y1 * sw + x0; val i11 = y1 * sw + x1
+                val w00 = (1 - tx) * (1 - ty); val w01 = tx * (1 - ty); val w10 = (1 - tx) * ty; val w11 = tx * ty
+                fun gainAt(c: Int): Double =
+                    gainS[i00 * 3 + c] * w00 + gainS[i01 * 3 + c] * w01 + gainS[i10 * 3 + c] * w10 + gainS[i11 * 3 + c] * w11
+                val bgY = bgYS[i00] * w00 + bgYS[i01] * w01 + bgYS[i10] * w10 + bgYS[i11] * w11
+
+                var r = (row[x * 3].toInt() and 0xFF) * gainAt(0)
+                var g = (row[x * 3 + 1].toInt() and 0xFF) * gainAt(1)
+                var b = (row[x * 3 + 2].toInt() and 0xFF) * gainAt(2)
+
+                val yv = max(1.0, 0.299 * r + 0.587 * g + 0.114 * b)
+                val rel = yv / bgY
+                if (rel < kr) {
+                    val f = (kr * Math.pow(rel / kr, INK_GAMMA)) / max(rel, 1e-6)
+                    r *= f; g *= f; b *= f
+                }
+                val mx = max(r, max(g, b))
+                if (mx > 255.0) { val f = 255.0 / mx; r *= f; g *= f; b *= f }
+                row[x * 3] = r.toInt().coerceIn(0, 255).toByte()
+                row[x * 3 + 1] = g.toInt().coerceIn(0, 255).toByte()
+                row[x * 3 + 2] = b.toInt().coerceIn(0, 255).toByte()
+            }
+            rgb.put(y, 0, row)
+        }
+
+        val outRgba = Mat()
+        Imgproc.cvtColor(rgb, outRgba, Imgproc.COLOR_RGB2RGBA)
+        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        Utils.matToBitmap(outRgba, result)
+        rgb.release(); outRgba.release()
+        return result
+    }
+
+    /**
+     * Removes soft-edged regions (tinted shadows) from [content] (8-bit mask, 255 = content). For each
+     * region, the background colour just inside its edge is compared with the colour just outside: printed
+     * colour shows a clear step, a shadow's penumbra barely any. Regions too thin to have an inside are
+     * dropped as well. [bg] is the interleaved RGB text-free background of the same size.
+     */
+    private fun dropSoftRegions(content: Mat, bg: ByteArray, sw: Int, sh: Int, k: Int, ker: Mat) {
+        val labels = Mat(); val stats = Mat(); val cents = Mat()
+        val n = Imgproc.connectedComponentsWithStats(content, labels, stats, cents, 8, CvType.CV_32S)
+        cents.release()
+        if (n <= 1) { labels.release(); stats.release(); return }
+        val lbl = IntArray(sw * sh); labels.get(0, 0, lbl); labels.release()
+        val cB = ByteArray(sw * sh); content.get(0, 0, cB)
+        val reg = Mat(); val inner = Mat(); val outer = Mat()
+        for (l in 1 until n) {
+            val bx = stats.get(l, Imgproc.CC_STAT_LEFT)[0].toInt()
+            val by = stats.get(l, Imgproc.CC_STAT_TOP)[0].toInt()
+            val bw = stats.get(l, Imgproc.CC_STAT_WIDTH)[0].toInt()
+            val bh = stats.get(l, Imgproc.CC_STAT_HEIGHT)[0].toInt()
+            // work in the region's bounding box, padded by k so the outer ring fits
+            val x0 = max(0, bx - k); val y0 = max(0, by - k)
+            val x1 = min(sw, bx + bw + k); val y1 = min(sh, by + bh + k)
+            val rw = x1 - x0; val rh = y1 - y0
+            val rb = ByteArray(rw * rh)
+            for (yy in 0 until rh) for (xx in 0 until rw) if (lbl[(y0 + yy) * sw + x0 + xx] == l) rb[yy * rw + xx] = 1
+            reg.create(rh, rw, CvType.CV_8UC1); reg.put(0, 0, rb)
+            Imgproc.erode(reg, inner, ker); Imgproc.dilate(reg, outer, ker)
+            val ib = ByteArray(rw * rh); inner.get(0, 0, ib)
+            val ob = ByteArray(rw * rh); outer.get(0, 0, ob)
+            val hIn = Array(3) { IntArray(256) }; val hOut = Array(3) { IntArray(256) }
+            var nIn = 0; var nOut = 0
+            for (j in 0 until rw * rh) {
+                val gi = ((y0 + j / rw) * sw + x0 + j % rw) * 3
+                if (ib[j].toInt() != 0) { nIn++; for (c in 0..2) hIn[c][bg[gi + c].toInt() and 0xFF]++ }
+                else if (ob[j].toInt() != 0 && rb[j].toInt() == 0) { nOut++; for (c in 0..2) hOut[c][bg[gi + c].toInt() and 0xFF]++ }
+            }
+            var step = 0.0
+            if (nIn > 0 && nOut > 0) {
+                for (c in 0..2) step = max(step, Math.abs(histMedian(hIn[c], nIn) - histMedian(hOut[c], nOut)))
+            }
+            if (step < SOFT_STEP) {
+                for (yy in 0 until rh) for (xx in 0 until rw) {
+                    val gi = (y0 + yy) * sw + x0 + xx
+                    if (lbl[gi] == l) cB[gi] = 0
+                }
+            }
+        }
+        reg.release(); inner.release(); outer.release(); stats.release()
+        content.put(0, 0, cB)
+    }
+
+    private fun histMedian(hist: IntArray, n: Int): Double {
+        var acc = 0
+        for (v in 0..255) { acc += hist[v]; if (acc * 2 >= n) return v.toDouble() }
+        return 255.0
+    }
+
+    /** Value at fraction q (0..1) of an 8-bit single-channel buffer. */
+    private fun histPercentile(bytes: ByteArray, q: Double): Double {
+        val hist = IntArray(256)
+        for (b in bytes) hist[b.toInt() and 0xFF]++
+        val target = (bytes.size * q).toLong()
+        var acc = 0L
+        for (i in 0 until 256) { acc += hist[i]; if (acc >= target) return i.toDouble() }
+        return 255.0
+    }
+
+    /** Median of channel [ch] of an interleaved 8-bit buffer, over the pixels where [mask] is true. */
+    private fun maskedMedian(bytes: ByteArray, channels: Int, ch: Int, mask: BooleanArray): Double {
+        val hist = IntArray(256)
+        var n = 0
+        for (i in mask.indices) if (mask[i]) { hist[bytes[i * channels + ch].toInt() and 0xFF]++; n++ }
+        if (n == 0) return 128.0
+        var acc = 0
+        for (v in 0..255) { acc += hist[v]; if (acc * 2 >= n) return v.toDouble() }
+        return 255.0
     }
 
     private fun writeJpeg(bitmap: Bitmap, path: String) {
@@ -781,7 +1171,8 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
             val result = Bitmap.createBitmap(cropped.cols(), cropped.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(cropped, result)
 
-            writeJpeg(result, outputPath)
+            // Every cropped page is cleaned once here, before it reaches the filter screen.
+            writeJpeg(removeShadowsFrom(result), outputPath)
             mask.release(); src.release(); cropped.release()
             if (deskewed !== whiteBg) deskewed.release()
             whiteBg.release()

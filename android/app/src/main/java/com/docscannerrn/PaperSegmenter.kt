@@ -142,8 +142,45 @@ class PaperSegmenter(private val context: Context) {
          */
         private const val PILE_HYSTERESIS = 0.04
 
-        /** Lines kept per orientation family. C(n,2)^2 candidates, so keep it small. */
-        private const val QUAD_LINES_PER_FAMILY = 5
+        /**
+         * Lines kept per orientation family. C(n,2)^2 candidates, so keep it small.
+         * PAPER-ON-PAPER: was 5. A sheet lying on others has its border close to the borders of the
+         * sheets below it, so a few more lines must survive for the right pair to be among them.
+         */
+        private const val QUAD_LINES_PER_FAMILY = 6
+
+        /**
+         * PAPER-ON-PAPER: two lines closer than this (fraction of the short side) with the same angle
+         * count as one edge. Was 6%, which merged the top sheet's border with the border of the sheet
+         * just under it whenever they were offset by a few millimetres, so the top sheet could never
+         * be formed.
+         */
+        private const val LINE_DEDUPE = 0.025
+
+        /** PAPER-ON-PAPER: black top-hat value (text-free paper minus image) above which a pixel is ink. */
+        private const val INK_THR = 28
+
+        /** PAPER-ON-PAPER: band (fraction of the short side) checked for ink beside a candidate border. */
+        private const val INK_BAND = 0.025
+
+        /**
+         * PAPER-ON-PAPER: the darkest the line ON a sheet border may be (top-hat, grey levels). A border
+         * between two white sheets is at most a faint shadow line; anything darker is printed ink.
+         */
+        private const val BORDER_LINE_MAX = 60
+
+        /** PAPER-ON-PAPER: paper on both sides of a border must be at least this bright (x paper level). */
+        private const val PAPER_BRIGHT = 0.80
+
+        /** PAPER-ON-PAPER: for a brightness step both sides must be at least this bright (not a photo). */
+        private const val STEP_BRIGHT = 0.60
+
+        /**
+         * PAPER-ON-PAPER: a nested quad whose two OPPOSITE sides each have only a narrow (< this fraction
+         * of the short side), similar-width strip of paper beyond them is a printed frame on one page,
+         * not a sheet lying on another.
+         */
+        private const val FRAME_MARGIN = 0.08
 
         /** A candidate quad's interior must be at least this fraction paper. */
         private const val QUAD_MIN_FILL = 0.90
@@ -766,7 +803,7 @@ class PaperSegmenter(private val context: Context) {
      * Returns null when no candidate is convincing, leaving the caller to fall back.
      */
     private fun findTopSheetQuadPass(
-        binS: Mat, grayS: Mat, lumS: Mat, ww: Int, wh: Int,
+        binS: Mat, grayS: Mat, lumS: Mat, tophatS: Mat, ww: Int, wh: Int,
         cannyLo: Double, cannyHi: Double, houghThresh: Int
     ): QuadResult? {
         val edges = Mat()
@@ -805,7 +842,7 @@ class PaperSegmenter(private val context: Context) {
             val base = segAngle(segs[0])
             val famA = ArrayList<DoubleArray>()
             val famB = ArrayList<DoubleArray>()
-            val dedupeDist = shortSide * 0.06
+            val dedupeDist = shortSide * LINE_DEDUPE
             for (s in segs) {
                 val off = angleDiff(segAngle(s), base)
                 val fam: ArrayList<DoubleArray>? =
@@ -840,6 +877,100 @@ class PaperSegmenter(private val context: Context) {
 
             fun lumAt(x: Int, y: Int): Int =
                 if (x in 0 until ww && y in 0 until wh) (lBuf[y * ww + x].toInt() and 0xFF) else -1
+
+            // ---------------- PAPER-ON-PAPER evidence ----------------
+            val tBuf = ByteArray(n)
+            tophatS.get(0, 0, tBuf)
+
+            fun tophatAt(x: Int, y: Int): Int =
+                (tBuf[y.coerceIn(0, wh - 1) * ww + x.coerceIn(0, ww - 1)].toInt() and 0xFF)
+
+            // Brightness of the paper itself: 90th percentile of the text-free image over the blob.
+            val paperLevel: Double = run {
+                val hist = IntArray(256)
+                var cnt = 0
+                for (i in 0 until n) if (bBuf[i] != 0.toByte()) { hist[lBuf[i].toInt() and 0xFF]++; cnt++ }
+                var acc = 0
+                var lvl = 255
+                for (v in 0..255) { acc += hist[v]; if (acc >= 0.9 * cnt) { lvl = v; break } }
+                if (cnt == 0) 255.0 else lvl.toDouble()
+            }
+            val band = max(5, (shortSide * INK_BAND).toInt())
+            val off0 = max(4.0, shortSide * INTERIOR_OFFSET)
+
+            /** Ink pixels along the normal at the given offsets from (px, py). */
+            fun inkNear(px: Double, py: Double, nx: Double, ny: Double, from: Int, to: Int): Int {
+                var h = 0
+                for (d in from..to) {
+                    val xx = (px + nx * d).toInt()
+                    val yy = (py + ny * d).toInt()
+                    if (xx in 0 until ww && yy in 0 until wh && (tBuf[yy * ww + xx].toInt() and 0xFF) > INK_THR) h++
+                }
+                return h
+            }
+
+            /**
+             * Fraction of segment a->b (outward normal nx,ny) that looks like the border of one sheet
+             * lying on another: an edge, text-free paper-bright paper on both sides, at most a faint
+             * line on it (shadow, not ink) and blank paper on the INSIDE (the top sheet's own margin).
+             *
+             * [insideOnly]: the outside may carry the lower sheet's text, because the top sheet cuts
+             * it off. The edge must then also be present where BOTH sides are blank: a real border is
+             * continuous, while the edge of a printed text block exists only where letters are.
+             */
+            fun edgeEvidence(ax: Double, ay: Double, bx: Double, by: Double,
+                             nx: Double, ny: Double, insideOnly: Boolean): Double {
+                val dx = bx - ax
+                val dy = by - ay
+                val len = hypot(dx, dy)
+                if (len < 1.0) return 0.0
+                val steps = max(8, (len / 2.0).toInt())
+                var good = 0; var cnt = 0; var gap = 0; var gapEdge = 0
+                for (t in 0..steps) {
+                    val f = t.toDouble() / steps
+                    val px = ax + dx * f
+                    val py = ay + dy * f
+                    val lo = lumAt((px + nx * off0).toInt(), (py + ny * off0).toInt())
+                    val li = lumAt((px - nx * off0).toInt(), (py - ny * off0).toInt())
+                    if (lo < 0 || li < 0) continue
+                    cnt++
+                    val e = edgeAt(px.toInt(), py.toInt())
+                    var insideMin = 255
+                    for (d in -band..-3) {
+                        val v = lumAt((px + nx * d).toInt(), (py + ny * d).toInt())
+                        if (v < insideMin) insideMin = v
+                    }
+                    val inBlank = inkNear(px, py, nx, ny, -band, -3) <= 1 && insideMin > PAPER_BRIGHT * paperLevel
+                    val outBlank = inkNear(px, py, nx, ny, 3, band) <= 1
+                    if (inBlank && outBlank) {
+                        gap++
+                        if (e) gapEdge++
+                    }
+                    if (!e || !inBlank) continue
+                    if (!insideOnly && !outBlank) continue
+                    if (lo < PAPER_BRIGHT * paperLevel || li < PAPER_BRIGHT * paperLevel) continue
+                    var on = 0
+                    for (d in -2..2) on = max(on, tophatAt((px + nx * d).toInt(), (py + ny * d).toInt()))
+                    if (on > BORDER_LINE_MAX) continue
+                    good++
+                }
+                if (cnt == 0) return 0.0
+                if (insideOnly && (gap < 0.15 * cnt || gapEdge < 0.6 * gap)) return 0.0
+                return good.toDouble() / cnt
+            }
+
+            // Per detected line: does it look like a sheet border? Used to reject a quad that has a
+            // full-length sheet border running through its middle (it would span two sheets).
+            val segEv = HashMap<DoubleArray, Double>()
+            for (sg in famA + famB) {
+                val dx = sg[2] - sg[0]
+                val dy = sg[3] - sg[1]
+                val len = hypot(dx, dy)
+                if (len < 1.0) continue
+                segEv[sg] = edgeEvidence(sg[0], sg[1], sg[2], sg[3], dy / len, -dx / len, false)
+            }
+            var bestNestedQuad: Array<Point>? = null
+            var bestNestedScore = 0.0
 
             val frameArea = ww.toDouble() * wh
             val halfDiag = 0.5 * hypot(ww.toDouble(), wh.toDouble())
@@ -918,6 +1049,7 @@ class PaperSegmenter(private val context: Context) {
                     val qcy = quad.sumOf { it.y } / 4.0
                     val off = max(4.0, shortSide * INTERIOR_OFFSET)
                     var interiorOk = true
+                    var interiorSides = 0
                     for (sIdx in 0 until 4) {
                         val a = quad[sIdx]
                         val b = quad[(sIdx + 1) % 4]
@@ -937,6 +1069,7 @@ class PaperSegmenter(private val context: Context) {
                         var outsidePaper = 0
                         var lumPairs = 0
                         var stepHits = 0
+                        val total = steps + 1
                         for (t in 0..steps) {
                             val f = t.toDouble() / steps
                             val px = a.x + dx * f
@@ -945,20 +1078,29 @@ class PaperSegmenter(private val context: Context) {
                             val ox = (px + nx * off).toInt()
                             val oy = (py + ny * off).toInt()
                             if (paperAt(ox, oy)) outsidePaper++
+                            val ix = (px - nx * off).toInt()
+                            val iy = (py - ny * off).toInt()
                             val lo = lumAt(ox, oy)
-                            val li = lumAt((px - nx * off).toInt(), (py - ny * off).toInt())
-                            if (lo >= 0 && li >= 0) {
+                            val li = lumAt(ix, iy)
+                            // PAPER-ON-PAPER: measure the step only where neither side has ink nearby (text
+                            // leaves the text-free image a few levels darker), and only between two bright
+                            // papers (a printed photo also makes a step).
+                            val cleanPt = inkNear(ox.toDouble(), oy.toDouble(), nx, ny, -3, 3) == 0 &&
+                                inkNear(ix.toDouble(), iy.toDouble(), nx, ny, -3, 3) == 0
+                            if (lo >= 0 && li >= 0 && cleanPt) {
                                 lumPairs++
-                                if (abs(lo - li) >= INTERIOR_STEP) stepHits++
+                                if (abs(lo - li) >= INTERIOR_STEP && min(lo, li) > STEP_BRIGHT * paperLevel) stepHits++
                             }
                         }
-                        val total = steps + 1
                         var sup = onEdge.toDouble() / total
                         // Paper continues beyond this side => it is an edge INSIDE the paper blob. It
                         // must show a brightness step (shadow / different tilt), otherwise it is just a
                         // printed line or fold inside one sheet and the quad is not a sheet.
                         if (outsidePaper.toDouble() / total > 0.4) {
-                            val stepFrac = if (lumPairs > 0) stepHits.toDouble() / lumPairs else 0.0
+                            interiorSides++
+                            var stepFrac = if (lumPairs > 0 && lumPairs >= 0.2 * total) stepHits.toDouble() / lumPairs else 0.0
+                            // PAPER-ON-PAPER: or a faint, continuous border line with the top sheet's blank margin inside.
+                            stepFrac = max(stepFrac, edgeEvidence(a.x, a.y, b.x, b.y, nx, ny, true))
                             if (stepFrac < INTERIOR_STEP_FRAC) interiorOk = false
                             sup = max(sup, stepFrac)
                         }
@@ -969,6 +1111,48 @@ class PaperSegmenter(private val context: Context) {
                     if (sortedSup[0] < QUAD_WEAKEST_SIDE_SUPPORT) continue
                     if (sortedSup[1] < QUAD_MIN_SIDE_SUPPORT) continue
                     val meanSup = sups.average()
+
+                    // PAPER-ON-PAPER: printed frame? The paper beyond two OPPOSITE sides is a narrow strip of
+                    // about the same width on both (a page margin). A sheet lying offset on another shows its
+                    // strip on adjacent sides instead, because it is shifted one way.
+                    if (interiorSides >= 2) {
+                        val gaps = IntArray(4)
+                        for (sIdx in 0 until 4) {
+                            val a = quad[sIdx]
+                            val b = quad[(sIdx + 1) % 4]
+                            val len = sideLens[sIdx]
+                            var nx = (b.y - a.y) / len
+                            var ny = -(b.x - a.x) / len
+                            val mx = (a.x + b.x) / 2
+                            val my = (a.y + b.y) / 2
+                            if (nx * (mx - qcx) + ny * (my - qcy) < 0) { nx = -nx; ny = -ny }
+                            var d = 0
+                            while (d < shortSide && paperAt((mx + nx * d).toInt(), (my + ny * d).toInt())) d++
+                            gaps[sIdx] = d
+                        }
+                        val lim = FRAME_MARGIN * shortSide
+                        val framed = (0..1).any { i ->
+                            val g1 = gaps[i]; val g2 = gaps[i + 2]
+                            g1 >= 3 && g2 >= 3 && g1 < lim && g2 < lim && min(g1, g2) >= 0.6 * max(g1, g2)
+                        }
+                        if (framed) continue
+                    }
+
+                    // PAPER-ON-PAPER: reject a quad with a full-length sheet border running through its middle.
+                    run {
+                        val poly = MatOfPoint2f(*quad)
+                        val minSide = sideLens.minOrNull() ?: 0.0
+                        var innerBorder = false
+                        for ((sg, ev) in segEv) {
+                            if (ev < INTERIOR_STEP_FRAC) continue
+                            if (hypot(sg[2] - sg[0], sg[3] - sg[1]) < 0.5 * minSide) continue
+                            val mid = Point((sg[0] + sg[2]) / 2, (sg[1] + sg[3]) / 2)
+                            if (Imgproc.pointPolygonTest(poly, mid, true) >= shortSide * 0.04) { innerBorder = true; break }
+                        }
+                        poly.release()
+                        if (innerBorder) return@run null
+                        Unit
+                    } ?: continue
 
                     val cx = quad.sumOf { it.x } / 4.0
                     val cy = quad.sumOf { it.y } / 4.0
@@ -983,11 +1167,21 @@ class PaperSegmenter(private val context: Context) {
                         (1.0 / (1.0 + 1.2 * dCenter)) * Math.pow(areaFrac, 0.6) *
                         (0.7 + 0.3 * prior)
 
+                    // PAPER-ON-PAPER: a quad with a side INSIDE the paper is a sheet lying on others; prefer it
+                    // over the outline of the whole pile, which otherwise always wins by being bigger.
+                    if (interiorSides > 0 && score > bestNestedScore) {
+                        bestNestedScore = score
+                        bestNestedQuad = quad
+                    }
                     if (score > bestScore) {
                         bestScore = score
                         bestQuad = quad
                     }
                 }
+            }
+            bestNestedQuad?.let {
+                bestQuad = it
+                bestScore = bestNestedScore
             }
 
             if (bestQuad == null) {
@@ -1012,14 +1206,18 @@ class PaperSegmenter(private val context: Context) {
     private fun findTopSheetQuad(binS: Mat, grayS: Mat, ww: Int, wh: Int): Array<Point>? {
         val lum = Mat()
         val eq = Mat()
+        val tophat = Mat()
         try {
             val k = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(9.0, 9.0))
             Imgproc.morphologyEx(grayS, lum, Imgproc.MORPH_CLOSE, k) // dark text strokes disappear
             k.release()
+            // PAPER-ON-PAPER: black top-hat = how much darker than the local paper each pixel is,
+            // i.e. an ink map. Taken from the ORIGINAL grey image and shared by both passes.
+            Core.subtract(lum, grayS, tophat)
 
-            val r1 = findTopSheetQuadPass(binS, grayS, lum, ww, wh, 40.0, 120.0, 35)
+            val r1 = findTopSheetQuadPass(binS, grayS, lum, tophat, ww, wh, 40.0, 120.0, 35)
             Imgproc.createCLAHE(3.0, Size(8.0, 8.0)).apply(grayS, eq)
-            val r2 = findTopSheetQuadPass(binS, eq, lum, ww, wh, 12.0, 36.0, 25)
+            val r2 = findTopSheetQuadPass(binS, eq, lum, tophat, ww, wh, 12.0, 36.0, 25)
 
             val best = listOfNotNull(r1, r2).maxByOrNull { it.score } ?: return null
             // Remember the winner (normalised) so next frame prefers a consistent choice.
@@ -1028,6 +1226,7 @@ class PaperSegmenter(private val context: Context) {
         } finally {
             lum.release()
             eq.release()
+            tophat.release()
         }
     }
 

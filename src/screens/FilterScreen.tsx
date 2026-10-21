@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { View, Text, StyleSheet, Image, TouchableOpacity, Alert } from 'react-native';
 import Slider from '@react-native-community/slider';
 import { usePagesStore } from '../store/pagesStore';
@@ -49,6 +49,13 @@ export default function FilterScreen({ route, navigation }: any) {
     },
     [filterType, rotation, brightness, contrast, page?.croppedImagePath, pageId]
   );
+
+  // Render the preview once on open so the selected filter is visible
+  // immediately, not only after the first tap.
+  useEffect(() => {
+    if (page) rerender();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageId]);
 
   // Guard: if we somehow landed here without a valid page (e.g. stale
   // navigation state after a hot reload), show a fallback instead of crashing.
