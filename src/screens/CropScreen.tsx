@@ -50,6 +50,9 @@ export default function CropScreen({ route, navigation }: any) {
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
 
   const addPage = usePagesStore((s) => s.addPage);
+  const updatePage = usePagesStore((s) => s.updatePage);
+  /** Set for a retake or re-crop: overwrite this page instead of adding a new one. */
+  const replacePageId: string | undefined = route.params.replacePageId;
 
   const scale = area ? Math.min(area.w / imageWidth, area.h / imageHeight) : 0;
   const dispW = imageWidth * scale;
@@ -181,6 +184,23 @@ export default function CropScreen({ route, navigation }: any) {
         await DocScannerNative.cropToContour(rawPath, imageCorners, correctedPath);
       }
 
+      // Remember the source photo and corners so the page can be re-cropped from the review screen.
+      const source = { rawPath, cropCorners: imageCorners, sourceWidth: imageWidth, sourceHeight: imageHeight };
+
+      if (replacePageId) {
+        const existing = usePagesStore.getState().pages.find((p) => p.id === replacePageId);
+        // A re-crop of the same photo keeps the page's rotation and filter; a retake (new photo) starts fresh.
+        const sameSource = existing?.rawPath === rawPath;
+        updatePage(replacePageId, {
+          croppedImagePath: correctedPath,
+          processedImagePath: correctedPath,
+          ...(sameSource ? {} : { rotationDegrees: 0, filterType: 'AUTO_ENHANCE', brightness: 0, contrast: 0 }),
+          ...source,
+        });
+        navigation.replace('Filter', { pageId: replacePageId });
+        return;
+      }
+
       const id = `page_${Date.now()}`;
       addPage({
         id,
@@ -190,6 +210,7 @@ export default function CropScreen({ route, navigation }: any) {
         filterType: 'AUTO_ENHANCE',
         brightness: 0,
         contrast: 0,
+        ...source,
       });
 
       navigation.replace('Filter', { pageId: id, isNewPage: true });

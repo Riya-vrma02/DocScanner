@@ -21,8 +21,23 @@ export interface DetectedDocuments {
   imageHeight: number;
 }
 
+export interface ImportedPdf {
+  /** File name of the chosen PDF, e.g. "notes.pdf". */
+  name: string;
+  /** Page count of the PDF (pages beyond the import limit are not rendered). */
+  totalPages: number;
+  pages: { path: string; width: number; height: number }[];
+}
+
 export const DocScannerNative = {
   capturePhoto: (): Promise<string> => DocScannerModule.capturePhoto(),
+
+  /**
+   * Opens the system file picker for a PDF and renders each page to a JPEG in outputDir.
+   * Rejects with code PDF_CANCELLED if the user closes the picker, PDF_PROTECTED for password-protected files.
+   */
+  pickAndImportPdf: (outputDir: string): Promise<ImportedPdf> =>
+    DocScannerModule.pickAndImportPdf(outputDir),
 
   detectDocumentCorners: (imagePath: string): Promise<DetectedCorners> =>
     DocScannerModule.detectDocumentCorners(imagePath),

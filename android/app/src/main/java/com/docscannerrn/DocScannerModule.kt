@@ -13,6 +13,7 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.pdf.PdfDocument
+import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
@@ -78,10 +79,20 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
 
     companion object {
         private const val CAPTURE_REQUEST_CODE = 9001
+        private const val PICK_PDF_REQUEST_CODE = 9002
+        /** Imported PDF pages are rendered at this resolution... */
+        private const val PDF_IMPORT_DPI = 200f
+        /** ...but never larger than this on the long side (keeps memory and file sizes sane). */
+        private const val PDF_IMPORT_MAX_PX = 3000
+        /** Safety limit on pages imported from one PDF. */
+        private const val PDF_IMPORT_MAX_PAGES = 200
     }
 
     private var capturePromise: Promise? = null
     private var pendingCapturePath: String? = null
+
+    private var pdfPromise: Promise? = null
+    private var pendingPdfOutDir: String? = null
 
     /** ML page segmentation (paper_seg.onnx); falls back to CV when unavailable. */
     private val paperSegmenter by lazy { PaperSegmenter(reactContext.applicationContext) }
@@ -127,6 +138,10 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
     }
 
     override fun onActivityResult(activity: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == PICK_PDF_REQUEST_CODE) {
+            onPdfPicked(resultCode, data)
+            return
+        }
         if (requestCode != CAPTURE_REQUEST_CODE) return
         val promise = capturePromise ?: return
         capturePromise = null
@@ -193,6 +208,108 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
     }
 
     override fun onNewIntent(intent: Intent?) {}
+
+    // ---------------------------------------------------------------------
+    // 1b. IMPORT PDF — system file picker + Android's built-in PdfRenderer
+    // ---------------------------------------------------------------------
+    /**
+     * Lets the user pick a PDF with the system file picker (Downloads, Drive, WhatsApp, ... — no storage
+     * permission needed) and renders every page to a JPEG in [outputDir].
+     * Resolves { name, pages: [{ path, width, height }] }; rejects PDF_CANCELLED if the picker is closed.
+     */
+    @ReactMethod
+    fun pickAndImportPdf(outputDir: String, promise: Promise) {
+        val activity: Activity? = currentActivity
+        if (activity == null) {
+            promise.reject("NO_ACTIVITY", "No current activity")
+            return
+        }
+        if (pdfPromise != null) {
+            promise.reject("PDF_BUSY", "A PDF import is already in progress")
+            return
+        }
+        pdfPromise = promise
+        pendingPdfOutDir = outputDir
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/pdf"
+        }
+        try {
+            activity.startActivityForResult(intent, PICK_PDF_REQUEST_CODE)
+        } catch (e: Exception) {
+            pdfPromise = null
+            pendingPdfOutDir = null
+            promise.reject("NO_PICKER", "No file picker available: ${e.message}")
+        }
+    }
+
+    private fun onPdfPicked(resultCode: Int, data: Intent?) {
+        val promise = pdfPromise ?: return
+        val outDir = pendingPdfOutDir
+        pdfPromise = null
+        pendingPdfOutDir = null
+        val uri = data?.data
+        if (resultCode != Activity.RESULT_OK || uri == null || outDir == null) {
+            promise.reject("PDF_CANCELLED", "No PDF was chosen")
+            return
+        }
+        // Rendering can take a few seconds for long documents: keep it off the UI thread.
+        Thread {
+            try {
+                promise.resolve(renderPdfPages(uri, outDir))
+            } catch (e: SecurityException) {
+                promise.reject("PDF_PROTECTED", "This PDF is password-protected and can't be opened")
+            } catch (e: Exception) {
+                promise.reject("PDF_IMPORT_FAILED", e.message ?: e.toString())
+            }
+        }.start()
+    }
+
+    private fun renderPdfPages(uri: Uri, outDir: String): WritableMap {
+        val resolver = reactContext.contentResolver
+        var name = "document.pdf"
+        resolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) name = c.getString(0)
+        }
+        File(outDir).mkdirs()
+        val stamp = System.currentTimeMillis()
+        val pages = Arguments.createArray()
+
+        val pfd = resolver.openFileDescriptor(uri, "r")
+            ?: throw IllegalStateException("Could not open the selected file")
+        pfd.use { fd ->
+            PdfRenderer(fd).use { renderer ->
+                val count = min(renderer.pageCount, PDF_IMPORT_MAX_PAGES)
+                if (count == 0) throw IllegalStateException("The PDF has no pages")
+                for (i in 0 until count) {
+                    renderer.openPage(i).use { page ->
+                        // page.width/height are in points (1/72 inch)
+                        var scale = PDF_IMPORT_DPI / 72f
+                        val longSide = max(page.width, page.height) * scale
+                        if (longSide > PDF_IMPORT_MAX_PX) scale *= PDF_IMPORT_MAX_PX / longSide
+                        val w = max(1, (page.width * scale).toInt())
+                        val h = max(1, (page.height * scale).toInt())
+                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        bmp.eraseColor(Color.WHITE)   // PDF pages can be transparent; JPEG would turn that black
+                        page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_PRINT)
+                        val path = "$outDir/pdf_${stamp}_${i + 1}.jpg"
+                        writeJpeg(bmp, path)
+                        bmp.recycle()
+                        pages.pushMap(Arguments.createMap().apply {
+                            putString("path", path)
+                            putInt("width", w)
+                            putInt("height", h)
+                        })
+                    }
+                }
+                return Arguments.createMap().apply {
+                    putString("name", name)
+                    putInt("totalPages", renderer.pageCount)
+                    putArray("pages", pages)
+                }
+            }
+        }
+    }
 
     // ---------------------------------------------------------------------
     // 2. DOCUMENT DETECTION — now finds MULTIPLE documents, and falls back

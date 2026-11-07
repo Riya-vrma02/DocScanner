@@ -16,10 +16,10 @@ interface PagesState {
  */
 export const usePagesStore = create<PagesState>((set, get) => ({
   pages: [],
-  addPage: (page) => set({ pages: [...get().pages, page] }),
+  addPage: (page) => set({ pages: [...get().pages, { ...page, version: Date.now() }] }),
   updatePage: (id, patch) =>
     set({
-      pages: get().pages.map((p) => (p.id === id ? { ...p, ...patch } : p)),
+      pages: get().pages.map((p) => (p.id === id ? { ...p, ...patch, version: Date.now() } : p)),
     }),
   removePage: (id) => set({ pages: get().pages.filter((p) => p.id !== id) }),
   reorder: (newOrder) => set({ pages: newOrder }),

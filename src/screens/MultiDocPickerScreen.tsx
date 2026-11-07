@@ -63,6 +63,10 @@ export default function MultiDocPickerScreen({ route, navigation }: any) {
           filterType: 'AUTO_ENHANCE',
           brightness: 0,
           contrast: 0,
+          // Lets the review screen re-crop this page from the original photo.
+          ...(doc.isQuadrilateral
+            ? { rawPath, cropCorners: doc.points, sourceWidth: imageWidth, sourceHeight: imageHeight }
+            : {}),
         });
       }
       navigation.navigate('Home');

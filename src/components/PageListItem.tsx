@@ -14,7 +14,7 @@ export default function PageListItem({page,index,onDelete,onEdit,onLongPress}:Pr
   return(
     <TouchableOpacity style={styles.card} onPress={onEdit} onLongPress={onLongPress} delayLongPress={150}>
       <Image source={{uri:`file://${page.processedImagePath}`}} style={styles.thumb} />
-      <Text style={styles.label}>Page{index+1}</Text>
+      <Text style={styles.label}>Page {index+1}</Text>
       <TouchableOpacity onPress={onDelete} style={styles.deleteBtn}>
         <Text style={styles.deleteText}>✕</Text>
       </TouchableOpacity>

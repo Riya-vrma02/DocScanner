@@ -182,6 +182,12 @@ class PaperSegmenter(private val context: Context) {
          */
         private const val FRAME_MARGIN = 0.08
 
+        /**
+         * WHITE-ON-WHITE: a detected line with ink on BOTH sides for more than this fraction of its length
+         * runs through text (letters stacked in columns), not along a page border, and is discarded.
+         */
+        private const val TEXT_LINE_FRAC = 0.3
+
         /** A candidate quad's interior must be at least this fraction paper. */
         private const val QUAD_MIN_FILL = 0.90
 
@@ -804,7 +810,7 @@ class PaperSegmenter(private val context: Context) {
      */
     private fun findTopSheetQuadPass(
         binS: Mat, grayS: Mat, lumS: Mat, tophatS: Mat, ww: Int, wh: Int,
-        cannyLo: Double, cannyHi: Double, houghThresh: Int
+        cannyLo: Double, cannyHi: Double, houghThresh: Int, maskText: Boolean = false
     ): QuadResult? {
         val edges = Mat()
         val region = Mat()
@@ -817,6 +823,16 @@ class PaperSegmenter(private val context: Context) {
             val k = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(5.0, 5.0))
             Imgproc.dilate(binS, region, k)
             Core.bitwise_and(edges, region, edges)
+            if (maskText) {
+                // WHITE-ON-WHITE (third pass only): erase edges near ink, so letters stacked in columns
+                // cannot crowd out a faint page border. Borders lie in blank margins, so they survive.
+                val ink = Mat()
+                Imgproc.threshold(tophatS, ink, INK_THR.toDouble(), 255.0, Imgproc.THRESH_BINARY)
+                val tk = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(7.0, 7.0))
+                Imgproc.dilate(ink, ink, tk)
+                edges.setTo(Scalar(0.0), ink)
+                ink.release(); tk.release()
+            }
             // Tolerate a couple of px of misalignment when testing side support.
             Imgproc.dilate(edges, edgesDil, k)
             k.release()
@@ -833,6 +849,32 @@ class PaperSegmenter(private val context: Context) {
             for (i in 0 until lines.rows()) {
                 val l = lines.get(i, 0)
                 if (hypot(l[2] - l[0], l[3] - l[1]) >= minLen) segs.add(l)
+            }
+            if (segs.size < 4) return null
+
+            // WHITE-ON-WHITE: drop "lines" that run through text (ink on BOTH sides for much of their length):
+            // letters stacked in columns chain into long segments that crowd the real borders out of the
+            // per-direction line budget. A real border always has blank paper on at least one side.
+            run {
+                val th = ByteArray(ww * wh)
+                tophatS.get(0, 0, th)
+                val bnd = max(5, (shortSide * INK_BAND).toInt())
+                fun inkAt(x: Int, y: Int) = x in 0 until ww && y in 0 until wh && (th[y * ww + x].toInt() and 0xFF) > INK_THR
+                segs.removeAll { sg ->
+                    val dx = sg[2] - sg[0]; val dy = sg[3] - sg[1]
+                    val len = hypot(dx, dy)
+                    val nx = dy / len; val ny = -dx / len
+                    val n = max(8, (len / 3).toInt())
+                    var both = 0
+                    for (t in 0..n) {
+                        val px = sg[0] + dx * t / n; val py = sg[1] + dy * t / n
+                        var sideA = false; var sideB = false
+                        for (d in 2..bnd) { if (inkAt((px + nx * d).toInt(), (py + ny * d).toInt())) { sideA = true; break } }
+                        for (d in 2..bnd) { if (inkAt((px - nx * d).toInt(), (py - ny * d).toInt())) { sideB = true; break } }
+                        if (sideA && sideB) both++
+                    }
+                    both.toDouble() / (n + 1) > TEXT_LINE_FRAC
+                }
             }
             if (segs.size < 4) return null
             segs.sortByDescending { hypot(it[2] - it[0], it[3] - it[1]) }
@@ -1131,9 +1173,31 @@ class PaperSegmenter(private val context: Context) {
                             gaps[sIdx] = d
                         }
                         val lim = FRAME_MARGIN * shortSide
+                        // Beyond a printed frame the strip runs out to the sheet's straight edge, so its width is
+                        // constant along the side. A leak of the paper mask onto a white surface is not.
+                        fun evenStrip(si: Int): Boolean {
+                            val a = quad[si]
+                            val b = quad[(si + 1) % 4]
+                            val len = sideLens[si]
+                            var nx = (b.y - a.y) / len
+                            var ny = -(b.x - a.x) / len
+                            if (nx * ((a.x + b.x) / 2 - qcx) + ny * ((a.y + b.y) / 2 - qcy) < 0) { nx = -nx; ny = -ny }
+                            val ws = DoubleArray(6)
+                            for ((j, t) in doubleArrayOf(0.15, 0.3, 0.45, 0.6, 0.75, 0.9).withIndex()) {
+                                val px = a.x + (b.x - a.x) * t
+                                val py = a.y + (b.y - a.y) * t
+                                var d = 0
+                                while (d < shortSide && paperAt((px + nx * d).toInt(), (py + ny * d).toInt())) d++
+                                ws[j] = d.toDouble()
+                            }
+                            val mean = ws.average()
+                            val sd = Math.sqrt(ws.sumOf { (it - mean) * (it - mean) } / ws.size)
+                            return mean > 0 && sd <= max(2.0, 0.25 * mean)
+                        }
                         val framed = (0..1).any { i ->
                             val g1 = gaps[i]; val g2 = gaps[i + 2]
-                            g1 >= 3 && g2 >= 3 && g1 < lim && g2 < lim && min(g1, g2) >= 0.6 * max(g1, g2)
+                            g1 >= 3 && g2 >= 3 && g1 < lim && g2 < lim && min(g1, g2) >= 0.6 * max(g1, g2) &&
+                                evenStrip(i) && evenStrip(i + 2)
                         }
                         if (framed) continue
                     }
@@ -1218,8 +1282,11 @@ class PaperSegmenter(private val context: Context) {
             val r1 = findTopSheetQuadPass(binS, grayS, lum, tophat, ww, wh, 40.0, 120.0, 35)
             Imgproc.createCLAHE(3.0, Size(8.0, 8.0)).apply(grayS, eq)
             val r2 = findTopSheetQuadPass(binS, eq, lum, tophat, ww, wh, 12.0, 36.0, 25)
+            // WHITE-ON-WHITE: same as pass 2 but with text edges erased, for a faint page border on a white
+            // surface. Competes on score with the other two, so piles are decided as before.
+            val r3 = findTopSheetQuadPass(binS, eq, lum, tophat, ww, wh, 12.0, 36.0, 25, maskText = true)
 
-            val best = listOfNotNull(r1, r2).maxByOrNull { it.score } ?: return null
+            val best = listOfNotNull(r1, r2, r3).maxByOrNull { it.score } ?: return null
             // Remember the winner (normalised) so next frame prefers a consistent choice.
             prevTopQuadN = Array(4) { Point(best.quad[it].x / ww, best.quad[it].y / wh) }
             return best.quad

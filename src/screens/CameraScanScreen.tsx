@@ -10,7 +10,9 @@ import NativeDocumentScannerView, { CapturedDocument, DetectionState } from '../
  * page and returns the image path + corners, which we hand to the existing
  * CropScreen for manual corner adjustment (unchanged flow from there on).
  */
-export default function CameraScanScreen({ navigation }: any) {
+export default function CameraScanScreen({ navigation, route }: any) {
+  // Set when this scan RETAKES an existing page (from the review screen).
+  const replacePageId: string | undefined = route?.params?.replacePageId;
   const [granted, setGranted] = useState<boolean | null>(null);
   // True when Android reports NEVER_ASK_AGAIN — the system dialog won't show
   // again, so the only way back is the app's Settings page.
@@ -59,6 +61,7 @@ export default function CameraScanScreen({ navigation }: any) {
         corners: doc.corners,
         imageWidth: doc.imageWidth,
         imageHeight: doc.imageHeight,
+        replacePageId,
       });
 
     // The still is a different frame from the preview, so overlap can appear
