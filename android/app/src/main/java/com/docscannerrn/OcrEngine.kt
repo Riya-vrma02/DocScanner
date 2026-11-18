@@ -42,7 +42,15 @@ import kotlin.math.roundToInt
 class OcrEngine private constructor() {
 
     class Word(val text: String, /** x0,y0 (tl), x1,y1 (tr), x2,y2 (br), x3,y3 (bl) */ val quad: FloatArray)
-    class Line(val text: String, val score: Float, val words: List<Word>)
+    /**
+     * One text line. box = l, t, r, b (px); capH = its capital-letter height (px);
+     * fit = median distance of its letters to the closest known letter (lower = more certain).
+     */
+    class Line(val text: String, val score: Float, val words: List<Word>,
+               val box: IntArray = IntArray(4), val capH: Float = 0f, val fit: Float = 0f)
+
+    /** Everything read from one page: text lines + boxes of things that aren't text (pictures, equations, rules). */
+    class Page(val lines: List<Line>, val nonText: List<IntArray>, val width: Int, val height: Int)
 
     companion object {
         private const val CHARSET =
@@ -206,8 +214,12 @@ class OcrEngine private constructor() {
 
     private class Ch(val c: Char, val l: Int, val t: Int, val r: Int, val b: Int, val d: Float)
 
+    /** Text lines of a page (for the PDF text layer). */
+    fun recognize(bitmap: Bitmap): List<Line> = analyze(bitmap).lines
+
+    /** Text lines plus the non-text regions of a page (for page layout, e.g. LaTeX export). */
     @Synchronized
-    fun recognize(bitmap: Bitmap): List<Line> {
+    fun analyze(bitmap: Bitmap): Page {
         val rgba = Mat(); val gray = Mat(); val bin = Mat(); val otsu = Mat()
         val labels = Mat(); val stats = Mat(); val cents = Mat()
         try {
@@ -221,14 +233,16 @@ class OcrEngine private constructor() {
             val n = Imgproc.connectedComponentsWithStats(bin, labels, stats, cents, 8, CvType.CV_32S)
             val st = IntArray(n * 5)
             stats.get(0, 0, st)
-            return readPage(n, st, labels)
+            val nonText = ArrayList<IntArray>()
+            val lines = readPage(n, st, labels, nonText)
+            return Page(lines, nonText, bitmap.width, bitmap.height)
         } finally {
             rgba.release(); gray.release(); bin.release(); otsu.release()
             labels.release(); stats.release(); cents.release()
         }
     }
 
-    private fun readPage(n: Int, st: IntArray, labels: Mat): List<Line> {
+    private fun readPage(n: Int, st: IntArray, labels: Mat, nonText: MutableList<IntArray>): List<Line> {
         var comps = ArrayList<Comp>()
         for (i in 1 until n) {
             val x = st[i * 5]; val y = st[i * 5 + 1]; val w = st[i * 5 + 2]; val h = st[i * 5 + 3]; val a = st[i * 5 + 4]
@@ -238,6 +252,7 @@ class OcrEngine private constructor() {
         val tallEnough = comps.filter { it.h >= 6 }.map { it.h.toDouble() }
         val medH = if (tallEnough.isNotEmpty()) median(tallEnough) else 10.0
         // pictures and ruled lines aren't letters
+        for (c in comps) if (c.h > 4 * medH || c.w > 15 * medH) nonText.add(intArrayOf(c.l, c.t, c.r, c.b))
         comps = ArrayList(comps.filter { it.h <= 4 * medH && it.w <= 15 * medH })
 
         val core = comps.filter { it.h >= 0.6 * medH }.sortedBy { it.l }
@@ -347,7 +362,9 @@ class OcrEngine private constructor() {
                 chars.add(Ch(ch, box[0], box[1], box[2], box[3], d))
             }
             if (chars.isEmpty()) continue
-            if (median(chars.map { it.d.toDouble() }) > MAX_FIT) continue   // not text (picture, noise)
+            val lbox = intArrayOf(chars.minOf { it.l }, chars.minOf { it.t }, chars.maxOf { it.r }, chars.maxOf { it.b })
+            val fit = median(chars.map { it.d.toDouble() }).toFloat()
+            if (fit > MAX_FIT) { nonText.add(lbox); continue }   // not text (picture, noise)
 
             // ---- words from the gaps between letters
             val gaps = (0 until chars.size - 1).map { (chars[it + 1].l - chars[it].r).toDouble() }
@@ -366,7 +383,7 @@ class OcrEngine private constructor() {
                     l.toFloat(), (bl - capH * 1.05).toFloat(), r.toFloat(), (br - capH * 1.05).toFloat(),
                     r.toFloat(), (br + capH * 0.3).toFloat(), l.toFloat(), (bl + capH * 0.3).toFloat()))
             }
-            out.add(words[0].quad[1].toDouble() to Line(words.joinToString(" ") { it.text }, 1f, words))
+            out.add(words[0].quad[1].toDouble() to Line(words.joinToString(" ") { it.text }, 1f, words, lbox, capH.toFloat(), fit))
         }
         out.sortBy { it.first }
         return out.map { it.second }

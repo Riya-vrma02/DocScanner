@@ -29,6 +29,53 @@ export interface ImportedPdf {
   pages: { path: string; width: number; height: number }[];
 }
 
+export interface PickedImage {
+  path: string;
+  width: number;
+  height: number;
+}
+
+export interface LatexResult {
+  /** The LaTeX source. */
+  tex: string;
+  /** The .tex file written to the output folder. */
+  texPath: string;
+  /** .zip with main.tex + figures/ (only when parts of the pages were kept as pictures), else null. */
+  zipPath: string | null;
+  /** Number of pictures cut out of the pages (equations, charts, photos, unreadable bits). */
+  figures: number;
+  pages: number;
+}
+
+export interface ImportedFile {
+  name: string;
+  kind: 'pdf' | 'image';
+  /** Pages in the file (a PDF longer than the import limit has more than `pages`). */
+  totalPages: number;
+  pages: { path: string; width: number; height: number }[];
+  /** Why the file gave no pages, or null. */
+  error: null | 'PDF_PROTECTED' | 'UNREADABLE';
+}
+
+export interface MergeInput {
+  /** App-private copy of the picked PDF. */
+  path: string;
+  name: string;
+  pages: number;
+  size: number;
+  /** Small JPEG of page 1, or null. */
+  thumb: string | null;
+  protected: boolean;
+}
+
+export interface SavedFile {
+  path: string;
+  name: string;
+  size: number;
+  /** ms since epoch */
+  modified: number;
+}
+
 export const DocScannerNative = {
   capturePhoto: (): Promise<string> => DocScannerModule.capturePhoto(),
 
@@ -38,6 +85,37 @@ export const DocScannerNative = {
    */
   pickAndImportPdf: (outputDir: string): Promise<ImportedPdf> =>
     DocScannerModule.pickAndImportPdf(outputDir),
+
+  /** System picker for one image; saves an upright JPEG copy in outputDir. Rejects IMAGE_CANCELLED if closed. */
+  pickImage: (outputDir: string): Promise<PickedImage> => DocScannerModule.pickImage(outputDir),
+
+  /** Reads the page images (on-device, OpenCV only) and writes <baseName>.tex (+ .zip with figures) to outputDir. */
+  imageToLatex: (imagePaths: string[], outputDir: string, baseName: string): Promise<LatexResult> =>
+    DocScannerModule.imageToLatex(imagePaths, outputDir, baseName),
+
+  copyToClipboard: (text: string): Promise<boolean> => DocScannerModule.copyToClipboard(text),
+
+  /** Copies any file into the public Downloads folder. */
+  saveFileToDownloads: (sourcePath: string, displayName: string, mimeType: string): Promise<string> =>
+    DocScannerModule.saveFileToDownloads(sourcePath, displayName, mimeType),
+
+  /** Pick any number of PDFs and images; each becomes pages. Rejects IMPORT_CANCELLED if closed. */
+  pickAndImportFiles: (outputDir: string): Promise<{ files: ImportedFile[] }> =>
+    DocScannerModule.pickAndImportFiles(outputDir),
+
+  /** Pick PDFs to merge (copied into outputDir). Rejects PDF_CANCELLED if closed. */
+  pickPdfsForMerge: (outputDir: string): Promise<MergeInput[]> => DocScannerModule.pickPdfsForMerge(outputDir),
+
+  /** Joins PDFs in order without re-rendering (text stays selectable). Rejects PDF_PROTECTED / PDF_UNREADABLE. */
+  mergePdfs: (paths: string[], names: string[], outputPath: string): Promise<{ path: string; pages: number; size: number }> =>
+    DocScannerModule.mergePdfs(paths, names, outputPath),
+
+  listFiles: (dir: string): Promise<SavedFile[]> => DocScannerModule.listFiles(dir),
+  renameFile: (path: string, newName: string): Promise<string> => DocScannerModule.renameFile(path, newName),
+  /** Opens the file in another app (PDF viewer etc.). Rejects NO_APP if none can open it. */
+  openFile: (path: string, mimeType: string): Promise<boolean> => DocScannerModule.openFile(path, mimeType),
+  /** Page 1 of a PDF as a small JPEG at outPath (cached). Resolves the path, or null. */
+  pdfThumbnail: (path: string, outPath: string): Promise<string | null> => DocScannerModule.pdfThumbnail(path, outPath),
 
   detectDocumentCorners: (imagePath: string): Promise<DetectedCorners> =>
     DocScannerModule.detectDocumentCorners(imagePath),

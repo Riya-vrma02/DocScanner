@@ -10,6 +10,9 @@ import IrregularCropScreen from './src/screens/IrregularCropScreen';
 import MultiDocPickerScreen from './src/screens/MultiDocPickerScreen';
 import FilterScreen from './src/screens/FilterScreen';
 import ReviewScreen from './src/screens/ReviewScreen';
+import LatexScreen from './src/screens/LatexScreen';
+import MergeScreen from './src/screens/MergeScreen';
+import FilesScreen from './src/screens/FilesScreen';
 
 export type RootStackParamList = {
   Home: undefined;
@@ -25,6 +28,18 @@ export type RootStackParamList = {
   IrregularCrop: { rawPath: string; points: { x: number; y: number }[] };
   MultiDocPicker: { rawPath: string; documents: any[]; imageWidth: number; imageHeight: number };
   Filter: { pageId: string };
+  /** Image to LaTeX (independent of the PDF flow). */
+  Latex: undefined;
+  /** Merge several PDFs into one (pages copied as they are). */
+  Merge: undefined;
+  /** Saved scans, merged PDFs and LaTeX made by the app. */
+  Files: undefined;
+};
+
+const darkHeader = {
+  headerStyle: { backgroundColor: '#1F2125' },
+  headerTintColor: '#FFFFFF',
+  headerShadowVisible: false,
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -54,6 +69,18 @@ export default function App() {
               headerShadowVisible: false,
             }}
           />
+          <Stack.Screen
+            name="Latex"
+            component={LatexScreen}
+            options={{
+              title: 'Image to LaTeX',
+              headerStyle: { backgroundColor: '#1F2125' },
+              headerTintColor: '#FFFFFF',
+              headerShadowVisible: false,
+            }}
+          />
+          <Stack.Screen name="Merge" component={MergeScreen} options={{ title: 'Merge files', ...darkHeader }} />
+          <Stack.Screen name="Files" component={FilesScreen} options={{ title: 'Files', ...darkHeader }} />
           <Stack.Screen name="Scan" component={CameraScanScreen} options={{ headerShown: false }} />
           <Stack.Screen name="Crop" component={CropScreen} options={{ title: 'Adjust corners' }} />
           <Stack.Screen name="IrregularCrop" component={IrregularCropScreen} options={{ title: 'Confirm crop' }} />

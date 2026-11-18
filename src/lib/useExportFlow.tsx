@@ -4,6 +4,7 @@ import Share from 'react-native-share';
 import { exportPagesToPdf } from './pdfExport';
 import { DocScannerNative } from '../native/DocScannerNative';
 import { PageSizeName, ScanPage } from '../types';
+import { stamp } from './files';
 
 /**
  * "Save PDF" flow shared by the grid and the page view: page-size picker -> build the PDF ->
@@ -39,7 +40,7 @@ export function useExportFlow(pages: ScanPage[]) {
     setPickerVisible(false);
     setExporting(true);
     try {
-      const fileName = `Scan_${Date.now()}.pdf`;
+      const fileName = `Scan_${stamp()}.pdf`;
       const path = await exportPagesToPdf(pages, pageSize, fileName);
       // A Modal rather than Alert.alert: Android lays out an alert's buttons in one row and clips
       // them on narrow screens, so "Share" + "Save to Downloads" + "Cancel" didn't fit.

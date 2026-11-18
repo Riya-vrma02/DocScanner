@@ -5,14 +5,18 @@ import {
 import { usePagesStore } from '../store/pagesStore';
 import { useExportFlow } from '../lib/useExportFlow';
 import DraggableGrid from '../components/DraggableGrid';
-import { pageUri } from './ReviewScreen';
+import ToolIcon, { ToolIconName } from '../components/ToolIcon';
 import { ScanPage } from '../types';
-import { importPdfPages } from '../lib/importPdf';
+import { importFiles } from '../lib/importFiles';
+/** Image URI of a page; the version makes a re-processed file with the same name reload. */
+function pageUri(p: ScanPage) {
+  return `file://${p.processedImagePath}?v=${p.version ?? 0}`;
+}
 
 /**
- * Home: every page of the current scan as a grid with its page number as a watermark.
- * Long-press a page and drag it to move it; tap a page to open it full size (retake, crop, rotate,
- * filters, delete). "Keep scanning" adds pages, "Save PDF" exports them in the order shown.
+ * Home: four options (Scan file, Import files, Merge files, Files) and, below them, every page of the
+ * current scan as a grid with its page number. Long-press a page and drag it to move it; tap a page to
+ * open it full size. "Save PDF" exports the pages in the order shown.
  */
 export default function HomeScreen({ navigation }: any) {
   const pages = usePagesStore((s) => s.pages);
@@ -23,20 +27,19 @@ export default function HomeScreen({ navigation }: any) {
   const { width } = useWindowDimensions();
   const numColumns = width >= 600 ? 4 : 3;
 
-  /** Pick a PDF and add its pages after the existing ones. */
-  async function onImportPdf() {
+  /** Pick PDFs and/or images and add all their pages after the existing ones. */
+  async function onImportFiles() {
     if (importing) return;
     setImporting(true);
     try {
-      const res = await importPdfPages(addPage);
-      if (res && res.added < res.totalPages) {
-        Alert.alert('Large PDF', `Imported the first ${res.added} of ${res.totalPages} pages of ${res.name}.`);
-      }
+      const res = await importFiles(addPage);
+      if (!res) return;
+      const notes: string[] = [];
+      res.truncated.forEach((t) => notes.push(`${t.name}: only the first ${t.added} of ${t.total} pages were added.`));
+      res.failed.forEach((f) => notes.push(`${f.name} ${f.reason === 'password-protected' ? 'is password-protected' : 'couldn\'t be read'}, so it was skipped.`));
+      if (notes.length) Alert.alert(`${res.added} page${res.added === 1 ? '' : 's'} added`, notes.join('\n\n'));
     } catch (e: any) {
-      const msg = e?.code === 'PDF_PROTECTED'
-        ? 'This PDF is password-protected, so its pages can\'t be opened.'
-        : `${e?.code ?? 'UNKNOWN'}: ${e?.message ?? String(e)}`;
-      Alert.alert('Couldn\'t import PDF', msg);
+      Alert.alert('Couldn\'t import', `${e?.code ?? 'UNKNOWN'}: ${e?.message ?? String(e)}`);
     } finally {
       setImporting(false);
     }
@@ -46,36 +49,55 @@ export default function HomeScreen({ navigation }: any) {
     navigation.setOptions({
       title: pages.length ? `${pages.length} page${pages.length === 1 ? '' : 's'}` : 'DocScanner',
       headerRight: () => (
-        <TouchableOpacity onPress={onImportPdf} disabled={importing} style={styles.headerBtn}>
-          <Text style={styles.headerBtnText}>Import PDF</Text>
+        <TouchableOpacity onPress={() => navigation.navigate('Latex')} style={styles.headerBtn}>
+          <Text style={styles.headerBtnText}>To LaTeX</Text>
         </TouchableOpacity>
       ),
     });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pages.length, navigation, importing]);
+  }, [pages.length, navigation]);
+
+  const options: { icon: ToolIconName; label: string; onPress: () => void }[] = [
+    { icon: 'scan', label: 'Scan file', onPress: () => navigation.navigate('Scan') },
+    { icon: 'import', label: 'Import files', onPress: onImportFiles },
+    { icon: 'merge', label: 'Merge files', onPress: () => navigation.navigate('Merge') },
+    { icon: 'folder', label: 'Files', onPress: () => navigation.navigate('Files') },
+  ];
+  const empty = pages.length === 0;
+
+  const optionTiles = (
+    <View style={[styles.options, empty && styles.optionsBig]}>
+      {options.map((o) => (
+        <TouchableOpacity
+          key={o.label}
+          style={[styles.option, empty && styles.optionBig]}
+          onPress={o.onPress}
+          disabled={importing}
+        >
+          <View style={[styles.optionIcon, empty && styles.optionIconBig]}>
+            <ToolIcon name={o.icon} size={empty ? 34 : 26} />
+          </View>
+          <Text style={[styles.optionText, empty && styles.optionTextBig]} numberOfLines={1}>{o.label}</Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
 
   const importingOverlay = (
     <Modal transparent visible={importing} animationType="fade">
       <View style={styles.busyOverlay}>
         <View style={styles.busyCard}>
           <ActivityIndicator size="large" color={BLUE} />
-          <Text style={styles.busyText}>Importing PDF…</Text>
+          <Text style={styles.busyText}>Importing files…</Text>
         </View>
       </View>
     </Modal>
   );
 
-  if (pages.length === 0) {
+  if (empty) {
     return (
       <View style={[styles.container, styles.emptyWrap]}>
-        <Text style={styles.emptyTitle}>No pages yet</Text>
-        <Text style={styles.emptyText}>Scan a page to start a new document.</Text>
-        <TouchableOpacity style={styles.emptyPrimary} onPress={() => navigation.navigate('Scan')}>
-          <Text style={styles.primaryText}>Scan a page</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.emptySecondary} onPress={onImportPdf} disabled={importing}>
-          <Text style={styles.secondaryText}>Import a PDF</Text>
-        </TouchableOpacity>
+        <Text style={styles.emptyTitle}>What would you like to do?</Text>
+        {optionTiles}
         {importingOverlay}
       </View>
     );
@@ -83,6 +105,7 @@ export default function HomeScreen({ navigation }: any) {
 
   return (
     <View style={styles.container}>
+      {optionTiles}
       <Text style={styles.hint}>Tap a page to open it · long-press and drag to move it</Text>
 
       <DraggableGrid<ScanPage>
@@ -125,7 +148,20 @@ const BLUE = '#1A73E8';
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#3A3C40' },
-  hint: { color: '#BDC1C6', fontSize: 13, textAlign: 'center', paddingTop: 10 },
+  hint: { color: '#BDC1C6', fontSize: 13, textAlign: 'center', paddingTop: 2 },
+
+  // ---- the four options: a compact row above the pages, big 2x2 tiles when there are no pages
+  options: { flexDirection: 'row', paddingHorizontal: 8, paddingTop: 12, paddingBottom: 8, backgroundColor: '#1F2125' },
+  optionsBig: { alignSelf: 'stretch', flexWrap: 'wrap', backgroundColor: 'transparent', paddingHorizontal: 0, justifyContent: 'center', gap: 14 },
+  option: { flex: 1, alignItems: 'center', paddingVertical: 4 },
+  optionBig: {
+    flex: 0, width: '44%', aspectRatio: 1.05, justifyContent: 'center', borderRadius: 16,
+    backgroundColor: '#1F2125', borderWidth: 1, borderColor: '#5F6368',
+  },
+  optionIcon: { width: 48, height: 48, borderRadius: 24, backgroundColor: BLUE, alignItems: 'center', justifyContent: 'center' },
+  optionIconBig: { width: 66, height: 66, borderRadius: 33 },
+  optionText: { color: '#FFFFFF', fontSize: 13, fontWeight: '600', marginTop: 6 },
+  optionTextBig: { fontSize: 16, marginTop: 12 },
 
   card: {
     flex: 1, backgroundColor: '#FFFFFF', borderRadius: 6, padding: 4,
@@ -149,18 +185,8 @@ const styles = StyleSheet.create({
   primaryText: { color: '#FFFFFF', fontSize: 17, fontWeight: '700' },
   dim: { opacity: 0.35 },
 
-  emptyWrap: { alignItems: 'center', justifyContent: 'center', padding: 24 },
-  emptyTitle: { color: '#FFFFFF', fontSize: 20, fontWeight: '700' },
-  emptyText: { color: '#BDC1C6', fontSize: 15, marginTop: 8, textAlign: 'center' },
-  // Own styles (no flex: 1 like the bottom-bar buttons) so they keep their size in the centred column.
-  emptyPrimary: {
-    alignSelf: 'stretch', height: 52, borderRadius: 26, backgroundColor: BLUE,
-    alignItems: 'center', justifyContent: 'center', marginTop: 24,
-  },
-  emptySecondary: {
-    alignSelf: 'stretch', height: 52, borderRadius: 26, borderWidth: 2, borderColor: '#FFFFFF',
-    alignItems: 'center', justifyContent: 'center', marginTop: 14,
-  },
+  emptyWrap: { alignItems: 'center', justifyContent: 'center', padding: 16 },
+  emptyTitle: { color: '#FFFFFF', fontSize: 20, fontWeight: '700', marginBottom: 20 },
 
   headerBtn: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, borderWidth: 1, borderColor: '#FFFFFF66' },
   headerBtnText: { color: '#FFFFFF', fontSize: 14, fontWeight: '600' },

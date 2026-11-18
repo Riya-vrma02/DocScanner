@@ -80,6 +80,12 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
     companion object {
         private const val CAPTURE_REQUEST_CODE = 9001
         private const val PICK_PDF_REQUEST_CODE = 9002
+        private const val PICK_IMAGE_REQUEST_CODE = 9003
+        private const val PICK_FILES_REQUEST_CODE = 9004
+        private const val PICK_MERGE_REQUEST_CODE = 9005
+        private const val THUMB_W = 240
+        /** Picked images are scaled down to this on the long side (enough for OCR, keeps memory sane). */
+        private const val PICK_IMAGE_MAX_PX = 4000
         /** Imported PDF pages are rendered at this resolution... */
         private const val PDF_IMPORT_DPI = 200f
         /** ...but never larger than this on the long side (keeps memory and file sizes sane). */
@@ -93,6 +99,14 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
 
     private var pdfPromise: Promise? = null
     private var pendingPdfOutDir: String? = null
+
+    private var imagePromise: Promise? = null
+    private var pendingImageOutDir: String? = null
+
+    private var filesPromise: Promise? = null
+    private var pendingFilesOutDir: String? = null
+    private var mergePromise: Promise? = null
+    private var pendingMergeOutDir: String? = null
 
     /** ML page segmentation (paper_seg.onnx); falls back to CV when unavailable. */
     private val paperSegmenter by lazy { PaperSegmenter(reactContext.applicationContext) }
@@ -140,6 +154,18 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
     override fun onActivityResult(activity: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
         if (requestCode == PICK_PDF_REQUEST_CODE) {
             onPdfPicked(resultCode, data)
+            return
+        }
+        if (requestCode == PICK_IMAGE_REQUEST_CODE) {
+            onImagePicked(resultCode, data)
+            return
+        }
+        if (requestCode == PICK_FILES_REQUEST_CODE) {
+            onFilesPicked(resultCode, data)
+            return
+        }
+        if (requestCode == PICK_MERGE_REQUEST_CODE) {
+            onMergePicked(resultCode, data)
             return
         }
         if (requestCode != CAPTURE_REQUEST_CODE) return
@@ -265,14 +291,14 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
         }.start()
     }
 
-    private fun renderPdfPages(uri: Uri, outDir: String): WritableMap {
+    private fun renderPdfPages(uri: Uri, outDir: String, tag: String = System.currentTimeMillis().toString()): WritableMap {
         val resolver = reactContext.contentResolver
         var name = "document.pdf"
         resolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
             if (c.moveToFirst() && !c.isNull(0)) name = c.getString(0)
         }
         File(outDir).mkdirs()
-        val stamp = System.currentTimeMillis()
+        val stamp = tag
         val pages = Arguments.createArray()
 
         val pfd = resolver.openFileDescriptor(uri, "r")
@@ -309,6 +335,456 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
                 }
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // 1c. PICK IMAGE + IMAGE TO LATEX
+    // ---------------------------------------------------------------------
+    /**
+     * Lets the user pick one image (gallery, Files, Drive...) and saves an upright JPEG copy in [outputDir].
+     * Resolves { path, width, height }; rejects IMAGE_CANCELLED if the picker is closed.
+     */
+    @ReactMethod
+    fun pickImage(outputDir: String, promise: Promise) {
+        val activity: Activity? = currentActivity
+        if (activity == null) {
+            promise.reject("NO_ACTIVITY", "No current activity")
+            return
+        }
+        if (imagePromise != null) {
+            promise.reject("IMAGE_BUSY", "An image is already being picked")
+            return
+        }
+        imagePromise = promise
+        pendingImageOutDir = outputDir
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "image/*"
+        }
+        try {
+            activity.startActivityForResult(intent, PICK_IMAGE_REQUEST_CODE)
+        } catch (e: Exception) {
+            imagePromise = null
+            pendingImageOutDir = null
+            promise.reject("NO_PICKER", "No file picker available: ${e.message}")
+        }
+    }
+
+    private fun onImagePicked(resultCode: Int, data: Intent?) {
+        val promise = imagePromise ?: return
+        val outDir = pendingImageOutDir
+        imagePromise = null
+        pendingImageOutDir = null
+        val uri = data?.data
+        if (resultCode != Activity.RESULT_OK || uri == null || outDir == null) {
+            promise.reject("IMAGE_CANCELLED", "No image was chosen")
+            return
+        }
+        Thread {
+            try {
+                val img = importImage(uri, outDir, System.currentTimeMillis().toString())
+                promise.resolve(Arguments.createMap().apply {
+                    putString("path", img.first); putInt("width", img.second); putInt("height", img.third)
+                })
+            } catch (e: Exception) {
+                promise.reject("IMAGE_IMPORT_FAILED", e.message ?: e.toString())
+            }
+        }.start()
+    }
+
+    /** Copies a picked image into [outDir] as an upright JPEG on white. Returns (path, width, height). */
+    private fun importImage(uri: Uri, outDir: String, tag: String): Triple<String, Int, Int> {
+        File(outDir).mkdirs()
+        // Raw copy first: needed to read the EXIF orientation.
+        val raw = File(reactContext.cacheDir, "pick_raw_$tag")
+        try {
+            reactContext.contentResolver.openInputStream(uri).use { input ->
+                if (input == null) throw IllegalStateException("Could not open the selected image")
+                FileOutputStream(raw).use { input.copyTo(it) }
+            }
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(raw.absolutePath, bounds)
+            var sample = 1
+            while (max(bounds.outWidth, bounds.outHeight) / sample > PICK_IMAGE_MAX_PX * 2) sample *= 2
+            var bmp = BitmapFactory.decodeFile(raw.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+                ?: throw IllegalStateException("This file isn't an image that can be opened")
+            val long = max(bmp.width, bmp.height)
+            if (long > PICK_IMAGE_MAX_PX) {
+                val s = PICK_IMAGE_MAX_PX.toFloat() / long
+                val scaled = Bitmap.createScaledBitmap(bmp, max(1, (bmp.width * s).toInt()), max(1, (bmp.height * s).toInt()), true)
+                if (scaled != bmp) bmp.recycle()
+                bmp = scaled
+            }
+            val orientation = try {
+                ExifInterface(raw.absolutePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            } catch (e: Exception) { ExifInterface.ORIENTATION_NORMAL }
+            val m = Matrix()
+            when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> m.postRotate(90f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> m.postRotate(180f)
+                ExifInterface.ORIENTATION_ROTATE_270 -> m.postRotate(270f)
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> m.postScale(-1f, 1f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> m.postScale(1f, -1f)
+                ExifInterface.ORIENTATION_TRANSPOSE -> { m.postRotate(90f); m.postScale(-1f, 1f) }
+                ExifInterface.ORIENTATION_TRANSVERSE -> { m.postRotate(270f); m.postScale(-1f, 1f) }
+            }
+            if (!m.isIdentity) {
+                val r = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                if (r != bmp) bmp.recycle()
+                bmp = r
+            }
+            // Transparent PNGs would turn black as JPEG: put them on white.
+            val flat = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888)
+            Canvas(flat).apply { drawColor(Color.WHITE); drawBitmap(bmp, 0f, 0f, null) }
+            bmp.recycle()
+            val path = "$outDir/picked_$tag.jpg"
+            writeJpeg(flat, path)
+            val res = Triple(path, flat.width, flat.height)
+            flat.recycle()
+            return res
+        } finally {
+            raw.delete()
+        }
+    }
+
+    /**
+     * Reads the given page images (OpenCV-only OCR) and writes a LaTeX document to [outputDir]:
+     * <baseName>.tex, plus <baseName>.zip (the .tex + its figures/ folder) when parts of the pages were
+     * kept as pictures. Resolves { tex, texPath, zipPath (null without figures), figures, pages }.
+     */
+    @ReactMethod
+    fun imageToLatex(imagePathsJs: ReadableArray, outputDir: String, baseName: String, promise: Promise) {
+        val paths = (0 until imagePathsJs.size()).mapNotNull { imagePathsJs.getString(it) }
+        Thread {
+            try {
+                val engine = OcrEngine.get(reactContext) ?: throw IllegalStateException("Text recognition is unavailable")
+                val dir = File(outputDir).apply { mkdirs() }
+                val figDir = File(dir, "${baseName}_figures")
+                figDir.deleteRecursively()
+                val writer = LatexWriter(figDir)
+                var pages = 0
+                for (p in paths) {
+                    val bmp = BitmapFactory.decodeFile(p) ?: continue
+                    try {
+                        writer.addPage(engine.analyze(bmp), bmp)
+                        pages++
+                    } finally {
+                        bmp.recycle()
+                    }
+                }
+                if (pages == 0) throw IllegalStateException("None of the images could be opened")
+                val tex = writer.toLatex("figures/")
+                val texFile = File(dir, "$baseName.tex")
+                texFile.writeText(tex, Charsets.UTF_8)
+                var zipPath: String? = null
+                if (writer.figures.isNotEmpty()) {
+                    // Ready to upload to Overleaf (New Project -> Upload Project) or to unzip and compile.
+                    val zip = File(dir, "$baseName.zip")
+                    java.util.zip.ZipOutputStream(FileOutputStream(zip)).use { zos ->
+                        zos.putNextEntry(java.util.zip.ZipEntry("main.tex"))
+                        zos.write(tex.toByteArray(Charsets.UTF_8))
+                        zos.closeEntry()
+                        for (f in writer.figures) {
+                            zos.putNextEntry(java.util.zip.ZipEntry("figures/$f"))
+                            File(figDir, f).inputStream().use { it.copyTo(zos) }
+                            zos.closeEntry()
+                        }
+                    }
+                    zipPath = zip.absolutePath
+                }
+                figDir.deleteRecursively()
+                promise.resolve(Arguments.createMap().apply {
+                    putString("tex", tex)
+                    putString("texPath", texFile.absolutePath)
+                    if (zipPath != null) putString("zipPath", zipPath) else putNull("zipPath")
+                    putInt("figures", writer.figures.size)
+                    putInt("pages", pages)
+                })
+            } catch (e: Exception) {
+                promise.reject("LATEX_FAILED", e.message ?: e.toString())
+            }
+        }.start()
+    }
+
+    /** Puts plain text on the clipboard. */
+    @ReactMethod
+    fun copyToClipboard(text: String, promise: Promise) {
+        try {
+            val cm = reactContext.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("LaTeX", text))
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("CLIPBOARD_FAILED", e.message, e)
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // 1d. IMPORT FILES (several PDFs + images) / MERGE PDFS / SAVED FILES
+    // ---------------------------------------------------------------------
+    private fun startPicker(mimeTypes: Array<String>, requestCode: Int, promise: Promise): Boolean {
+        val activity: Activity? = currentActivity
+        if (activity == null) { promise.reject("NO_ACTIVITY", "No current activity"); return false }
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = if (mimeTypes.size == 1) mimeTypes[0] else "*/*"
+            if (mimeTypes.size > 1) putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes)
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+        return try {
+            activity.startActivityForResult(intent, requestCode); true
+        } catch (e: Exception) {
+            promise.reject("NO_PICKER", "No file picker available: ${e.message}"); false
+        }
+    }
+
+    /** Every file chosen in a multi-select picker, in the order given. */
+    private fun pickedUris(data: Intent?): List<Uri> {
+        if (data == null) return emptyList()
+        val clip = data.clipData
+        if (clip != null && clip.itemCount > 0) return (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }
+        return listOfNotNull(data.data)
+    }
+
+    private fun displayName(uri: Uri, fallback: String): String {
+        try {
+            reactContext.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                if (c.moveToFirst() && !c.isNull(0)) return c.getString(0)
+            }
+        } catch (e: Exception) { }
+        return fallback
+    }
+
+    /**
+     * Picks any number of PDFs and images at once and turns them into pages (PDF pages rendered,
+     * images copied upright). Resolves { files: [{ name, kind: "pdf"|"image", totalPages,
+     * pages: [{path,width,height}], error: null|"PDF_PROTECTED"|"UNREADABLE" }] }, in the order picked.
+     */
+    @ReactMethod
+    fun pickAndImportFiles(outputDir: String, promise: Promise) {
+        if (filesPromise != null) { promise.reject("IMPORT_BUSY", "An import is already in progress"); return }
+        filesPromise = promise
+        pendingFilesOutDir = outputDir
+        if (!startPicker(arrayOf("application/pdf", "image/*"), PICK_FILES_REQUEST_CODE, promise)) {
+            filesPromise = null; pendingFilesOutDir = null
+        }
+    }
+
+    private fun onFilesPicked(resultCode: Int, data: Intent?) {
+        val promise = filesPromise ?: return
+        val outDir = pendingFilesOutDir
+        filesPromise = null; pendingFilesOutDir = null
+        val uris = pickedUris(data)
+        if (resultCode != Activity.RESULT_OK || uris.isEmpty() || outDir == null) {
+            promise.reject("IMPORT_CANCELLED", "No file was chosen")
+            return
+        }
+        Thread {
+            val stamp = System.currentTimeMillis()
+            val files = Arguments.createArray()
+            for ((i, uri) in uris.withIndex()) {
+                val mime = try { reactContext.contentResolver.getType(uri) } catch (e: Exception) { null } ?: ""
+                val name = displayName(uri, "file ${i + 1}")
+                val isPdf = mime == "application/pdf" || name.lowercase().endsWith(".pdf")
+                val item = Arguments.createMap()
+                item.putString("name", name)
+                item.putString("kind", if (isPdf) "pdf" else "image")
+                try {
+                    if (isPdf) {
+                        val r = renderPdfPages(uri, outDir, "${stamp}_$i")
+                        item.putInt("totalPages", r.getInt("totalPages"))
+                        item.putArray("pages", r.getArray("pages")?.let { arr ->
+                            Arguments.createArray().also { out -> for (k in 0 until arr.size()) out.pushMap(Arguments.createMap().apply { merge(arr.getMap(k)!!) }) }
+                        })
+                    } else {
+                        val img = importImage(uri, outDir, "${stamp}_$i")
+                        item.putInt("totalPages", 1)
+                        item.putArray("pages", Arguments.createArray().apply {
+                            pushMap(Arguments.createMap().apply {
+                                putString("path", img.first); putInt("width", img.second); putInt("height", img.third)
+                            })
+                        })
+                    }
+                    item.putNull("error")
+                } catch (e: SecurityException) {
+                    item.putInt("totalPages", 0); item.putArray("pages", Arguments.createArray()); item.putString("error", "PDF_PROTECTED")
+                } catch (e: Exception) {
+                    item.putInt("totalPages", 0); item.putArray("pages", Arguments.createArray()); item.putString("error", "UNREADABLE")
+                }
+                files.pushMap(item)
+            }
+            promise.resolve(Arguments.createMap().apply { putArray("files", files) })
+        }.start()
+    }
+
+    /**
+     * Picks PDFs to merge. Each is copied into [outputDir] (so it stays readable) and described:
+     * resolves [{ path, name, pages, size, thumb, protected }] in the order picked.
+     */
+    @ReactMethod
+    fun pickPdfsForMerge(outputDir: String, promise: Promise) {
+        if (mergePromise != null) { promise.reject("PICK_BUSY", "Already picking files"); return }
+        mergePromise = promise
+        pendingMergeOutDir = outputDir
+        if (!startPicker(arrayOf("application/pdf"), PICK_MERGE_REQUEST_CODE, promise)) {
+            mergePromise = null; pendingMergeOutDir = null
+        }
+    }
+
+    private fun onMergePicked(resultCode: Int, data: Intent?) {
+        val promise = mergePromise ?: return
+        val outDir = pendingMergeOutDir
+        mergePromise = null; pendingMergeOutDir = null
+        val uris = pickedUris(data)
+        if (resultCode != Activity.RESULT_OK || uris.isEmpty() || outDir == null) {
+            promise.reject("PDF_CANCELLED", "No PDF was chosen")
+            return
+        }
+        Thread {
+            try {
+                File(outDir).mkdirs()
+                val stamp = System.currentTimeMillis()
+                val list = Arguments.createArray()
+                for ((i, uri) in uris.withIndex()) {
+                    val name = displayName(uri, "document ${i + 1}.pdf")
+                    val dest = File(outDir, "in_${stamp}_$i.pdf")
+                    reactContext.contentResolver.openInputStream(uri).use { input ->
+                        if (input == null) throw IllegalStateException("Could not open $name")
+                        FileOutputStream(dest).use { input.copyTo(it) }
+                    }
+                    val info = describePdf(dest, File(outDir, "thumb_${stamp}_$i.jpg"))
+                    list.pushMap(Arguments.createMap().apply {
+                        putString("path", dest.absolutePath)
+                        putString("name", name)
+                        putInt("pages", info.first)
+                        putDouble("size", dest.length().toDouble())
+                        if (info.second != null) putString("thumb", info.second) else putNull("thumb")
+                        putBoolean("protected", info.third)
+                    })
+                }
+                promise.resolve(list)
+            } catch (e: Exception) {
+                promise.reject("PDF_IMPORT_FAILED", e.message ?: e.toString())
+            }
+        }.start()
+    }
+
+    /** (page count, thumbnail of page 1 or null, password-protected?) */
+    private fun describePdf(pdf: File, thumbOut: File): Triple<Int, String?, Boolean> {
+        return try {
+            android.os.ParcelFileDescriptor.open(pdf, android.os.ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                PdfRenderer(fd).use { r ->
+                    var thumb: String? = null
+                    if (r.pageCount > 0) r.openPage(0).use { pg ->
+                        val w = THUMB_W
+                        val h = max(1, (pg.height.toFloat() / pg.width * w).toInt())
+                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        bmp.eraseColor(Color.WHITE)
+                        pg.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        writeJpeg(bmp, thumbOut.absolutePath)
+                        bmp.recycle()
+                        thumb = thumbOut.absolutePath
+                    }
+                    Triple(r.pageCount, thumb, false)
+                }
+            }
+        } catch (e: SecurityException) {
+            Triple(0, null, true)
+        } catch (e: Exception) {
+            Triple(0, null, false)
+        }
+    }
+
+    /**
+     * Joins the PDFs (in this order) into [outputPath] without re-rendering anything, so text stays
+     * sharp and selectable. Resolves { path, pages, size }; rejects PDF_PROTECTED / PDF_UNREADABLE
+     * (message names the file).
+     */
+    @ReactMethod
+    fun mergePdfs(pathsJs: ReadableArray, namesJs: ReadableArray, outputPath: String, promise: Promise) {
+        val inputs = (0 until pathsJs.size()).map { i ->
+            File(pathsJs.getString(i) ?: "") to (if (i < namesJs.size()) namesJs.getString(i) ?: "file ${i + 1}" else "file ${i + 1}")
+        }
+        Thread {
+            val out = File(outputPath)
+            try {
+                val pages = PdfMerger().merge(inputs, out)
+                promise.resolve(Arguments.createMap().apply {
+                    putString("path", out.absolutePath); putInt("pages", pages); putDouble("size", out.length().toDouble())
+                })
+            } catch (e: PdfMerger.ProtectedPdfException) {
+                out.delete()
+                promise.reject("PDF_PROTECTED", "${e.fileName} is password-protected, so it can't be merged.")
+            } catch (e: PdfMerger.BadPdfException) {
+                out.delete()
+                promise.reject("PDF_UNREADABLE", "${e.fileName} couldn't be read. It may be damaged.")
+            } catch (e: Throwable) {
+                out.delete()
+                promise.reject("MERGE_FAILED", e.message ?: e.toString())
+            }
+        }.start()
+    }
+
+    /** Files in [dir] (not folders), newest first: [{ path, name, size, modified }]. */
+    @ReactMethod
+    fun listFiles(dir: String, promise: Promise) {
+        try {
+            val arr = Arguments.createArray()
+            File(dir).listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() }?.forEach { f ->
+                arr.pushMap(Arguments.createMap().apply {
+                    putString("path", f.absolutePath); putString("name", f.name)
+                    putDouble("size", f.length().toDouble()); putDouble("modified", f.lastModified().toDouble())
+                })
+            }
+            promise.resolve(arr)
+        } catch (e: Exception) {
+            promise.reject("LIST_FAILED", e.message, e)
+        }
+    }
+
+    /** Renames a file inside its folder. Resolves the new path; rejects FILE_EXISTS if the name is taken. */
+    @ReactMethod
+    fun renameFile(path: String, newName: String, promise: Promise) {
+        try {
+            val src = File(path)
+            val clean = newName.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            if (clean.isEmpty()) { promise.reject("BAD_NAME", "Enter a name"); return }
+            val dest = File(src.parentFile, clean)
+            if (dest.exists() && dest.absolutePath != src.absolutePath) { promise.reject("FILE_EXISTS", "A file called $clean already exists"); return }
+            if (!src.renameTo(dest)) { promise.reject("RENAME_FAILED", "Couldn't rename the file"); return }
+            promise.resolve(dest.absolutePath)
+        } catch (e: Exception) {
+            promise.reject("RENAME_FAILED", e.message, e)
+        }
+    }
+
+    /** Opens a file of this app in another app (PDF viewer, file manager, ...). */
+    @ReactMethod
+    fun openFile(path: String, mimeType: String, promise: Promise) {
+        try {
+            val uri = FileProvider.getUriForFile(reactContext, "${reactContext.packageName}.fileprovider", File(path))
+            val view = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mimeType)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(view, "Open with").apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+            reactContext.startActivity(chooser)
+            promise.resolve(true)
+        } catch (e: android.content.ActivityNotFoundException) {
+            promise.reject("NO_APP", "No app on this phone can open this file")
+        } catch (e: Exception) {
+            promise.reject("OPEN_FAILED", e.message, e)
+        }
+    }
+
+    /** First page of a PDF as a small JPEG (cached at [outPath]); resolves the path or null. */
+    @ReactMethod
+    fun pdfThumbnail(path: String, outPath: String, promise: Promise) {
+        Thread {
+            val out = File(outPath)
+            if (out.exists() && out.lastModified() >= File(path).lastModified()) { promise.resolve(outPath); return@Thread }
+            out.parentFile?.mkdirs()
+            promise.resolve(describePdf(File(path), out).second)
+        }.start()
     }
 
     // ---------------------------------------------------------------------
@@ -1128,6 +1604,16 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun savePdfToDownloads(sourcePath: String, displayName: String, promise: Promise) {
+        saveToDownloads(sourcePath, displayName, "application/pdf", promise)
+    }
+
+    /** Same as savePdfToDownloads for any file type (e.g. application/zip, application/x-tex). */
+    @ReactMethod
+    fun saveFileToDownloads(sourcePath: String, displayName: String, mimeType: String, promise: Promise) {
+        saveToDownloads(sourcePath, displayName, mimeType, promise)
+    }
+
+    private fun saveToDownloads(sourcePath: String, displayName: String, mimeType: String, promise: Promise) {
         try {
             val src = File(sourcePath)
             if (!src.exists()) {
@@ -1139,7 +1625,7 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
                 val resolver = reactContext.contentResolver
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, "application/pdf")
+                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
                     put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
