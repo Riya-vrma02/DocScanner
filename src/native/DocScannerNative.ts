@@ -91,11 +91,13 @@ export const DocScannerNative = {
   getDocumentDirectory: (): Promise<string> => DocScannerModule.getDocumentDirectory(),
   getCacheDirectory: (): Promise<string> => DocScannerModule.getCacheDirectory(),
 
+  /** ocr: run on-device text recognition and add an invisible text layer, making the PDF searchable. */
   exportToPdf: (
     imagePaths: string[],
     pageSize: PageSizeName,
-    outputPath: string
-  ): Promise<string> => DocScannerModule.exportToPdf(imagePaths, pageSize, outputPath),
+    outputPath: string,
+    ocr: boolean = true
+  ): Promise<string> => DocScannerModule.exportToPdf(imagePaths, pageSize, outputPath, ocr),
 
   /**
    * Copies a generated PDF into the device's public Downloads folder.

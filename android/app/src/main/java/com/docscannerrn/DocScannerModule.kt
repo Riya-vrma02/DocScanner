@@ -1005,7 +1005,9 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
     // 6. PDF EXPORT — android.graphics.pdf.PdfDocument
     // ---------------------------------------------------------------------
     @ReactMethod
-    fun exportToPdf(imagePathsJs: ReadableArray, pageSizeName: String, outputPath: String, promise: Promise) {
+    fun exportToPdf(imagePathsJs: ReadableArray, pageSizeName: String, outputPath: String, ocr: Boolean, promise: Promise) {
+        // On-device OCR (OpenCV only, see OcrEngine.kt): adds a selectable/copyable text layer.
+        val ocrEngine: OcrEngine? = if (ocr) OcrEngine.get(reactContext) else null
         try {
             val document = PdfDocument()
             val (pageWidthPt, pageHeightPt) = pointDimensions(pageSizeName)
@@ -1031,6 +1033,15 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
                 val destRect = RectF(left, top, left + drawW, top + drawH)
                 page.canvas.drawBitmap(bitmap, null, destRect, Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG))
 
+                if (ocrEngine != null) {
+                    try {
+                        val lines = ocrEngine.recognize(bitmap)
+                        drawInvisibleText(page.canvas, lines, scale, left, top)
+                    } catch (e: Exception) {
+                        // OCR is a bonus: if it fails on a page, that page is simply not searchable.
+                    }
+                }
+
                 document.finishPage(page)
                 bitmap.recycle()
             }
@@ -1043,6 +1054,57 @@ class DocScannerModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(outputPath)
         } catch (e: Exception) {
             promise.reject("PDF_EXPORT_FAILED", e.message, e)
+        }
+    }
+
+    /**
+     * Searchable-PDF text layer: draws every recognised WORD as text over the page image, scaled and
+     * rotated to cover exactly that word in the image, so PDF viewers can search, select and copy it
+     * and highlights land on the right words (per-word placement, like OCRmyPDF; a whole line drawn
+     * as one stretched string drifts off the words because font spacing never matches the page).
+     *
+     * The text is drawn with alpha 1/255: invisible in practice (verified: 0 grey-level difference
+     * when rendered). It can't be fully transparent: Skia, which PdfDocument uses, drops alpha-0
+     * drawing completely, so no text would be written to the PDF.
+     *
+     * (scale, left, top) map image pixels to PDF points, the same transform used to draw the image.
+     */
+    private fun drawInvisibleText(canvas: Canvas, lines: List<OcrEngine.Line>, scale: Float, left: Float, top: Float) {
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(1, 255, 255, 255)
+            textSize = 100f
+        }
+        // Height of the font's ascent+descent per unit of text size.
+        val fm0 = paint.fontMetrics
+        val heightPerSize = (fm0.descent - fm0.ascent) / 100f
+        val descentPerSize = fm0.descent / 100f
+
+        for (line in lines) {
+            for (w in line.words) {
+                val str = w.text.trim()
+                if (str.isEmpty()) continue
+                // Word box corners (image px): 0 top-left, 1 top-right, 3 bottom-left.
+                val x0 = w.quad[0]; val y0 = w.quad[1]
+                val x1 = w.quad[2]; val y1 = w.quad[3]
+                val x3 = w.quad[6]; val y3 = w.quad[7]
+                val widthPt = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat() * scale
+                val heightPt = Math.hypot((x3 - x0).toDouble(), (y3 - y0).toDouble()).toFloat() * scale
+                if (widthPt < 1f || heightPt < 1f) continue
+                val angle = Math.toDegrees(Math.atan2((y1 - y0).toDouble(), (x1 - x0).toDouble())).toFloat()
+
+                paint.textSize = heightPt / heightPerSize
+                paint.textScaleX = 1f
+                val measured = paint.measureText(str)
+                if (measured <= 0f) continue
+                paint.textScaleX = widthPt / measured
+
+                canvas.save()
+                // Origin at the word's bottom-left corner, x along its direction.
+                canvas.translate(left + x3 * scale, top + y3 * scale)
+                canvas.rotate(angle)
+                canvas.drawText(str, 0f, -descentPerSize * paint.textSize, paint)
+                canvas.restore()
+            }
         }
     }
 

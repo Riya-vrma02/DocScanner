@@ -14,5 +14,6 @@ export async function exportPagesToPdf(
   const docDir = await DocScannerNative.getDocumentDirectory();
   const outputPath = `${docDir}/${outputFileName}`;
   const imagePaths = pages.map((p) => p.processedImagePath);
-  return DocScannerNative.exportToPdf(imagePaths, pageSizeName, outputPath);
+  // ocr = true: pages are run through on-device text recognition so the PDF is searchable.
+  return DocScannerNative.exportToPdf(imagePaths, pageSizeName, outputPath, true);
 }
